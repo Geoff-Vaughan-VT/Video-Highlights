@@ -316,6 +316,62 @@ kbd{font:600 11px var(--mono);background:var(--surface-3);border:1px solid var(-
 .stage .pbox.sel{box-shadow:0 0 0 3px var(--accent)}
 .stage .pbox span{position:absolute;left:-2px;bottom:100%;margin-bottom:2px;background:var(--c,#fff);color:#000;font:700 10px/1.4 var(--font);padding:0 4px;border-radius:3px;white-space:nowrap}
 .stage .pickhint{position:absolute;left:50%;top:var(--s3);transform:translateX(-50%);background:rgba(10,12,15,.85);color:#fff;font-size:var(--fs-sm);padding:6px 12px;border-radius:999px;display:flex;gap:8px;align-items:center;pointer-events:none}
+.stage .overlay>.layer{position:absolute;inset:0;pointer-events:none}
+/* pitch calibration (fixed colours: always drawn over video) */
+.stage .overlay.calibrating{pointer-events:auto;cursor:crosshair;background:rgba(0,0,0,.12);touch-action:none}
+.stage .calsvg{position:absolute;inset:0;overflow:visible;font:700 11px var(--font)}
+.calsvg .pl-halo{fill:none;stroke:rgba(0,0,0,.55);stroke-width:4;stroke-linejoin:round}
+.calsvg .pl{fill:none;stroke:#fff;stroke-width:1.6;stroke-linejoin:round;opacity:.95}
+.calsvg .spot{fill:#fff;stroke:rgba(0,0,0,.5);stroke-width:1}
+.calsvg .quad{fill:rgba(198,240,74,.07);stroke:#c6f04a;stroke-width:1.5;stroke-dasharray:6 4}
+.calsvg .quad.open{fill:none}
+.calsvg .quad.bad{fill:rgba(240,96,93,.12);stroke:#f0605d}
+.calsvg .goal{--g:#5aa9f5;cursor:move}
+.calsvg .goal.right{--g:#fb923c}
+.calsvg .goal rect{fill:color-mix(in srgb,var(--g) 22%,transparent);stroke:var(--g);stroke-width:2}
+.calsvg .goal.auto{cursor:inherit}
+.calsvg .goal.auto rect{stroke-dasharray:5 3;fill:color-mix(in srgb,var(--g) 12%,transparent)}
+.calsvg .goal text,.calsvg .ch text{fill:#fff;paint-order:stroke;stroke:rgba(0,0,0,.75);stroke-width:3px;stroke-linejoin:round}
+.calsvg .goal text{fill:var(--g)}
+.calsvg .ch{cursor:grab}
+.calsvg .ch.drag{cursor:grabbing}
+.calsvg .ch .hit{fill:transparent;pointer-events:all}
+.calsvg .ch .dot{fill:rgba(10,12,15,.55);stroke:#c6f04a;stroke-width:2.5}
+.calsvg .ch.drag .dot,.calsvg .ch:hover .dot{fill:rgba(198,240,74,.35)}
+.calsvg .ch .pin{fill:#c6f04a}
+.stage .calhint{max-width:calc(100% - 24px);white-space:nowrap}
+.stage .calhint span{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.stage .calhint b{color:#c6f04a}
+.calpanel{margin:var(--s2) 0 0}
+.calpanel .calhead{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;margin-bottom:var(--s3)}
+.calpanel .calhead .panel-title{flex:none}
+.calsteps{display:flex;gap:6px;flex-wrap:wrap;flex:1}
+.calstep{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-xs);padding:3px 10px;border-radius:999px;border:1px solid var(--line-strong);color:var(--text-3)}
+.calstep b{font-weight:700}
+.calstep.cur{color:var(--text);border-color:var(--accent);background:var(--accent-soft)}
+.calstep.done{color:var(--ok);border-color:transparent;background:var(--ok-soft)}
+.calbody{display:grid;grid-template-columns:128px minmax(0,1fr);gap:var(--s4);align-items:start}
+.calctl{display:grid;gap:var(--s3)}
+.calctl .warnnote,.calctl .errnote,.calctl .oknote{margin:0}
+.calrow{display:flex;gap:var(--s2);align-items:center;flex-wrap:wrap}
+.calsep{width:1px;height:22px;background:var(--line-strong);margin:0 var(--s1)}
+.calrow.apply{padding-top:var(--s3);border-top:1px solid var(--line)}
+.btn-ghost.on{color:var(--accent);background:var(--accent-soft)}
+.oknote{color:var(--ok);font-size:var(--fs-sm);display:flex;gap:8px;align-items:flex-start}
+.calmini svg{width:100%;display:block;font:700 5px var(--font)}
+.calmini .mp{fill:var(--pitch);stroke:var(--pitch-line);stroke-width:.8}
+.calmini .mpl{fill:none;stroke:var(--pitch-line);stroke-width:.6}
+.calmini .cd circle{fill:var(--surface-3);stroke:var(--line-strong);stroke-width:.8}
+.calmini .cd text{fill:var(--text-3)}
+.calmini .cd.done circle{fill:var(--accent);stroke:var(--accent)}
+.calmini .cd.done text{fill:var(--accent-ink)}
+.calmini .cd.next circle{fill:var(--surface);stroke:var(--accent);stroke-width:1.6;animation:pulse 1.4s infinite}
+.calmini .cd.next text{fill:var(--text)}
+.calpanel .queued{border-color:var(--accent);margin:0}
+@media (max-width:700px){.calbody{grid-template-columns:1fr}.calmini{max-width:120px}.calsep{display:none}
+  .calsteps{order:3;flex-basis:100%}.calpanel .calhead{justify-content:space-between}
+  .stage .calhint{font-size:var(--fs-xs);top:var(--s1);padding:4px 10px}.stage .calhint kbd{display:none}}
+.calbadge{display:inline-flex;gap:var(--s2);align-items:center;flex-wrap:wrap}
 .stage .center-msg{position:absolute;inset:0;display:grid;place-items:center;color:#cfd5dd;font-size:var(--fs-sm);text-align:center;padding:var(--s4)}
 .stage .flash{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.6);color:#fff;border-radius:999px;padding:12px;opacity:0;transition:opacity .3s;pointer-events:none}
 .stage .flash.show{opacity:1;transition:none}

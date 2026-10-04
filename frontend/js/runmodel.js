@@ -95,6 +95,8 @@ export function buildModel(run) {
     players,
     labels: { ...(run.player_labels || {}) },
     calibration: run.player_stats?.pitch_calibration || null,
+    // Saved manual calibration (calibration.json): normalized TL, TR, BR, BL.
+    manualCalibration: run.calibration || null,
     teamStats: normalizeTeamStats(run.team_stats, names, colors),
     thumbs: run.thumbs || [],
     sources: sources(run),

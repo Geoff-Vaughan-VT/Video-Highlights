@@ -258,3 +258,80 @@ def test_system_info(client, run_root):
     body = client.get("/v1/studio/system").json()
     assert body["output_root"] == str(Path(settings.output_root).resolve())
     assert "encoders" in body["ffmpeg"]
+
+
+CORNERS = [[0.05, 0.1], [0.95, 0.1], [0.98, 0.9], [0.02, 0.9]]
+
+
+def test_calibration_roundtrip(client, run_root):
+    url = f"/v1/studio/runs/{RUN_ID}/calibration"
+    assert client.get(url).json() == {"run_id": RUN_ID, "calibration": None}
+    assert client.get(f"/v1/studio/runs/{RUN_ID}").json()["calibration"] is None
+
+    put = client.put(url, json={
+        "pitch_corners": CORNERS,
+        "goal_box_left": {"x1": 0.06, "y1": 0.55, "x2": 0.0, "y2": 0.45, "normalized": True},
+        "goal_box_right": None,
+        "frame_width": 999, "frame_height": 999,  # tracks_meta wins
+        "normalized": True,
+    })
+    assert put.status_code == 200, put.text
+    saved = put.json()["calibration"]
+    assert saved["pitch_corners"] == CORNERS
+    assert saved["goal_box_left"] == {"x1": 0.0, "y1": 0.45, "x2": 0.06, "y2": 0.55, "normalized": True}
+    assert saved["goal_box_right"] is None
+    assert (saved["frame_width"], saved["frame_height"]) == (320, 180)
+    assert saved["normalized"] is True and saved["updated_at"]
+    assert (run_root / "calibration.json").exists()
+
+    assert client.get(url).json()["calibration"] == saved
+    assert client.get(f"/v1/studio/runs/{RUN_ID}").json()["calibration"] == saved
+
+    # Pixel input is converted with the run's frame size and stored normalized.
+    pixels = [[x * 320, y * 180] for x, y in CORNERS]
+    put_px = client.put(url, json={"pitch_corners": pixels, "normalized": False,
+                                   "goal_box_right": {"x1": 304, "y1": 81, "x2": 320, "y2": 99}})
+    assert put_px.status_code == 200, put_px.text
+    stored = put_px.json()["calibration"]
+    assert [v for p in stored["pitch_corners"] for v in p] == pytest.approx([v for p in CORNERS for v in p])
+    right = stored["goal_box_right"]
+    assert right.pop("normalized") is True
+    assert right == pytest.approx({"x1": 0.95, "y1": 0.45, "x2": 1.0, "y2": 0.55})
+
+    deleted = client.delete(url)
+    assert deleted.status_code == 200 and deleted.json()["deleted"] is True
+    assert client.get(url).json()["calibration"] is None
+
+
+def test_calibration_validation(client, run_root):
+    url = f"/v1/studio/runs/{RUN_ID}/calibration"
+    bad_bodies = [
+        {"pitch_corners": CORNERS[:3]},  # 3 corners
+        {"pitch_corners": CORNERS + [[0.5, 0.5]]},  # 5 corners
+        {"pitch_corners": [[0.1, 0.1, 0.2], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]},
+        {"pitch_corners": "nope"},
+        {},
+        {"pitch_corners": [[0.1, 0.1], [1.2, 0.1], [0.9, 0.9], [0.1, 0.9]]},  # > 1 while normalized
+        {"pitch_corners": [[-0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]},
+        {"pitch_corners": [[0.1, 0.1], ["x", 0.1], [0.9, 0.9], [0.1, 0.9]]},
+        {"pitch_corners": [[0.1, 0.1], [0.9, 0.9], [0.9, 0.1], [0.1, 0.9]]},  # wrong order (self-crossing)
+        {"pitch_corners": CORNERS, "goal_box_left": {"x1": 0.1, "y1": 0.2}},
+        {"pitch_corners": CORNERS, "goal_box_left": {"x1": 0.1, "y1": 0.2, "x2": 1.5, "y2": 0.4}},
+        {"pitch_corners": CORNERS, "goal_box_right": {"x1": 0.5, "y1": 0.5, "x2": 0.5, "y2": 0.5}},
+        {"pitch_corners": [[0, 0], [400, 0], [320, 180], [0, 180]], "normalized": False},  # outside frame
+    ]
+    for body in bad_bodies:
+        response = client.put(url, json=body)
+        assert response.status_code == 400, (body, response.status_code, response.text)
+    assert not (run_root / "calibration.json").exists()
+
+
+def test_calibration_path_safety(client, run_root):
+    body = {"pitch_corners": CORNERS}
+    for run_id in ("..", "..%2F..", "%2E%2E", "run_test%2F..%2F..", "does_not_exist", "a b"):
+        for method in ("get", "put", "delete"):
+            kwargs = {"json": body} if method == "put" else {}
+            response = getattr(client, method)(f"/v1/studio/runs/{run_id}/calibration", **kwargs)
+            assert response.status_code in {400, 404, 405}, (run_id, method, response.status_code)
+    assert not (run_root.parent / "calibration.json").exists()
+    assert not (run_root.parent.parent / "calibration.json").exists()

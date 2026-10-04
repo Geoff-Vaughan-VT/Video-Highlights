@@ -8,9 +8,14 @@ import { playerName, teamColor, teamName } from '../../runmodel.js';
 import { $, esc, fmtClock, toast } from '../../ui.js';
 import { openPlayerCard } from './playercard.js';
 
-export function createPicker(ctx, player, { onFilterEvents }) {
+export function createPicker(ctx, player, { onFilterEvents, onStart }) {
   const model = ctx.model;
   const overlay = player.overlay;
+  // Own layer inside the shared overlay so other modes (pitch calibration)
+  // can draw there without being wiped by this one.
+  const layer = document.createElement('div');
+  layer.className = 'layer';
+  overlay.appendChild(layer);
   const state = { on: false, data: null, selected: null, seq: 0 };
 
   // Rendered video rectangle inside the stage (object-fit: contain).
@@ -25,12 +30,12 @@ export function createPicker(ctx, player, { onFilterEvents }) {
   }
 
   function draw() {
-    if (!state.on) { overlay.innerHTML = ''; overlay.classList.remove('picking'); return; }
+    if (!state.on) { layer.innerHTML = ''; overlay.classList.remove('picking'); return; }
     overlay.classList.add('picking');
     const data = state.data;
     const hint = `<div class="pickhint">${icon('target', 'sm')}<span>${data ? (data.players.length
       ? `Click a player · ${data.players.length} tracked at ${fmtClock(data.t)}` : `Nobody tracked at ${fmtClock(data.t)} — scrub a little`) : 'Loading players…'}</span><kbd>Esc</kbd></div>`;
-    if (!data) { overlay.innerHTML = hint; return; }
+    if (!data) { layer.innerHTML = hint; return; }
     const r = videoRect();
     const fw = data.frame_width || player.video.videoWidth;
     const fh = data.frame_height || player.video.videoHeight;
@@ -46,7 +51,7 @@ export function createPicker(ctx, player, { onFilterEvents }) {
         style="left:${left}px;top:${top}px;width:${width}px;height:${height}px;--c:${esc(teamColor(model, p.team))}"
         aria-label="${esc(playerName(model, p.track_id, p.number))}, ${esc(teamName(model, p.team))}"><span>${esc(name)}</span></button>`;
     }).join('');
-    overlay.innerHTML = boxes + hint;
+    layer.innerHTML = boxes + hint;
   }
 
   async function load() {
@@ -70,6 +75,7 @@ export function createPicker(ctx, player, { onFilterEvents }) {
     if (!model.tracksAvailable) { toast('This run has no tracks.npz, so players cannot be picked.', 'warn'); return; }
     const wide = model.sources.find((s) => s.wide);
     if (!wide) { toast('Player picking needs the wide view (proxy video), which this run does not have.', 'warn'); return; }
+    onStart?.();
     state.on = true;
     player.pause();
     if (player.source?.key !== wide.key) {
@@ -123,6 +129,6 @@ export function createPicker(ctx, player, { onFilterEvents }) {
     start,
     stop,
     toggle() { return state.on ? stop() : start(); },
-    destroy() { ro.disconnect(); player.video.removeEventListener('seeked', onSeeked); player.video.removeEventListener('play', onPlay); },
+    destroy() { ro.disconnect(); layer.remove(); player.video.removeEventListener('seeked', onSeeked); player.video.removeEventListener('play', onPlay); },
   };
 }

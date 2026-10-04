@@ -51,17 +51,19 @@ export function applyHomography(H, x, y) {
   return [(H[0][0] * x + H[0][1] * y + H[0][2]) / w, (H[1][0] * x + H[1][1] * y + H[1][2]) / w];
 }
 
-// Event location in pitch metres, or null. `mode` reports how it was found.
-export function eventLocation(event, calibration, frame) {
+// Event location in pitch metres (0..105 x 0..68), or null. `mapper` is an
+// image-pixel -> pitch-metre projector from homography.calibrationMapper()
+// (manual calibration preferred, then the analysis calibration); `mode`
+// reports how the location was found.
+export function eventLocation(event, mapper, frame) {
   const ev = event.evidence || {};
   const metres = ev.pitch_xy_m || ev.location_m || (ev.x_m != null && ev.y_m != null ? [ev.x_m, ev.y_m] : null);
   if (metres) return { xy: metres.map(Number), mode: 'metres' };
   const px = ev.ball_xy || ev.location_px || (ev.ball_x != null && ev.ball_y != null ? [ev.ball_x, ev.ball_y] : null);
   if (!px) return null;
-  const H = calibration?.homography;
-  if (Array.isArray(H) && H.length === 3) {
-    const xy = applyHomography(H, +px[0], +px[1]);
-    if (xy && Number.isFinite(xy[0]) && Number.isFinite(xy[1])) return { xy, mode: 'calibrated' };
+  if (mapper?.toPitch) {
+    const xy = mapper.toPitch(+px[0], +px[1]);
+    if (xy && Number.isFinite(xy[0]) && Number.isFinite(xy[1])) return { xy, mode: mapper.mode };
   }
   if (frame?.w && frame?.h) return { xy: [(+px[0] / frame.w) * PITCH.L, (+px[1] / frame.h) * PITCH.W], mode: 'image' };
   return null;

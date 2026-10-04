@@ -13,6 +13,7 @@ directory (no path traversal).
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -67,6 +68,7 @@ _ACTIVE_STATUSES = {"queued", "claimed", "running", "cancel_requested"}
 _STARTED_STATUSES = {"claimed", "running", "cancel_requested", "completed", "failed", "canceled"}
 _THUMB_INTERVAL_S = 10.0
 LABELS_FILENAME = "player_labels.json"
+CALIBRATION_FILENAME = "calibration.json"
 POSTER_FILENAME = "studio_poster.jpg"
 
 _READ_ROLES = ("admin", "analyst", "coach", "parent", "system", "tenant_admin")
@@ -588,6 +590,7 @@ def _run_summary(
             "thumbs": thumbs,
             "tracks_meta": {k: v for k, v in tracks_meta.items() if k != "players"},
             "player_labels": _read_json(path / LABELS_FILENAME).get("labels", {}),
+            "calibration": _read_json(path / CALIBRATION_FILENAME) or None,
             "state_summary_s": states.get("state_summary_s", {}),
             "goal_events": states.get("goal_events", []),
             "card_events": states.get("card_events", []),
@@ -886,6 +889,142 @@ def put_player_labels(
     doc = {"updated_at": utcnow().isoformat(), "labels": labels}
     _write_json_atomic(run / LABELS_FILENAME, doc)
     return {"run_id": run_id, **doc}
+
+
+# ---------------------------------------------------------------------------
+# Manual pitch calibration (calibration.json)
+# ---------------------------------------------------------------------------
+#
+# The Studio "Calibrate pitch" mode stores the 4 playing-area corners (TL, TR,
+# BR, BL) and optional goal mouths per run, always as normalized [0, 1]
+# coordinates of the source frame. They are sent unchanged as the job config
+# keys ``pitch_corners`` / ``goal_box_left`` / ``goal_box_right`` on
+# "Re-analyze with calibration" (the pipeline scales normalized values by the
+# source frame size; see VideoHighlights._normalize_corners and
+# game_tracking._goal_box_from_override).
+
+
+class CalibrationPut(BaseModel):
+    # Loosely typed so shape errors come back as 400 with a clear message.
+    pitch_corners: Any = None
+    goal_box_left: Any = None
+    goal_box_right: Any = None
+    frame_width: Optional[int] = Field(default=None, ge=1, le=16384)
+    frame_height: Optional[int] = Field(default=None, ge=1, le=16384)
+    normalized: bool = True
+
+
+def _finite(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _convex_quad(points: List[List[float]]) -> bool:
+    signs = []
+    for i in range(4):
+        a, b, c = points[i], points[(i + 1) % 4], points[(i + 2) % 4]
+        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        signs.append(cross)
+    return all(v > 1e-9 for v in signs) or all(v < -1e-9 for v in signs)
+
+
+def _calibration_frame(run: Path, payload: CalibrationPut) -> Tuple[Optional[int], Optional[int]]:
+    meta = _read_json(run / TRACKS_META_FILENAME)
+    try:
+        width = int(meta.get("frame_width") or 0) or None
+        height = int(meta.get("frame_height") or 0) or None
+    except (TypeError, ValueError):
+        width = height = None
+    return width or payload.frame_width, height or payload.frame_height
+
+
+def _normalize_point(x: Any, y: Any, normalized: bool, size: Tuple[Optional[int], Optional[int]], what: str) -> List[float]:
+    fx, fy = _finite(x), _finite(y)
+    if fx is None or fy is None:
+        raise HTTPException(status_code=400, detail=f"{what}: coordinates must be finite numbers")
+    if not normalized:
+        width, height = size
+        if not width or not height:
+            raise HTTPException(status_code=400, detail=f"{what}: pixel coordinates need frame_width/frame_height")
+        fx, fy = fx / width, fy / height
+    if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+        raise HTTPException(status_code=400, detail=f"{what}: coordinates must lie inside the frame ([0, 1] normalized)")
+    return [round(fx, 6), round(fy, 6)]
+
+
+def _normalize_goal_box(raw: Any, side: str, normalized: bool,
+                        size: Tuple[Optional[int], Optional[int]]) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or any(k not in raw for k in ("x1", "y1", "x2", "y2")):
+        raise HTTPException(status_code=400, detail=f"goal_box_{side} must be {{x1, y1, x2, y2}}")
+    box_normalized = bool(raw.get("normalized", normalized))
+    x1, y1 = _normalize_point(raw["x1"], raw["y1"], box_normalized, size, f"goal_box_{side}")
+    x2, y2 = _normalize_point(raw["x2"], raw["y2"], box_normalized, size, f"goal_box_{side}")
+    x1, x2 = min(x1, x2), max(x1, x2)
+    y1, y2 = min(y1, y2), max(y1, y2)
+    if x2 - x1 < 1e-3 or y2 - y1 < 1e-3:
+        raise HTTPException(status_code=400, detail=f"goal_box_{side} is empty")
+    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "normalized": True}
+
+
+@router.get("/studio/runs/{run_id}/calibration")
+def get_calibration(run_id: str) -> Dict[str, object]:
+    """The run's saved manual calibration (``null`` when none was saved)."""
+    doc = _read_json(_run_dir(run_id) / CALIBRATION_FILENAME)
+    return {"run_id": run_id, "calibration": doc or None}
+
+
+@router.put("/studio/runs/{run_id}/calibration")
+def put_calibration(
+    run_id: str,
+    payload: CalibrationPut,
+    _: UserContext = Depends(require_roles(*_WRITE_ROLES)),
+) -> Dict[str, object]:
+    """Save the manual pitch calibration: 4 corners TL, TR, BR, BL (+ goal mouths).
+
+    Stored normalized to the source frame; pixel input (``normalized: false``)
+    is converted with the run's frame size.
+    """
+    run = _run_dir(run_id)
+    size = _calibration_frame(run, payload)
+    raw_corners = payload.pitch_corners
+    if (not isinstance(raw_corners, list) or len(raw_corners) != 4
+            or any(not isinstance(p, (list, tuple)) or len(p) != 2 for p in raw_corners)):
+        raise HTTPException(status_code=400, detail="pitch_corners must be exactly 4 [x, y] points (TL, TR, BR, BL)")
+    corners = [_normalize_point(p[0], p[1], payload.normalized, size, "pitch_corners") for p in raw_corners]
+    width, height = size
+    aspect = [float(width or 1), float(height or 1)]
+    if not _convex_quad([[x * aspect[0], y * aspect[1]] for x, y in corners]):
+        raise HTTPException(status_code=400, detail="pitch_corners must form a convex quadrilateral in order TL, TR, BR, BL")
+    doc = {
+        "pitch_corners": corners,
+        "goal_box_left": _normalize_goal_box(payload.goal_box_left, "left", payload.normalized, size),
+        "goal_box_right": _normalize_goal_box(payload.goal_box_right, "right", payload.normalized, size),
+        "frame_width": width,
+        "frame_height": height,
+        "normalized": True,
+        "updated_at": utcnow().isoformat(),
+    }
+    _write_json_atomic(run / CALIBRATION_FILENAME, doc)
+    return {"run_id": run_id, "calibration": doc}
+
+
+@router.delete("/studio/runs/{run_id}/calibration")
+def delete_calibration(
+    run_id: str,
+    _: UserContext = Depends(require_roles(*_WRITE_ROLES)),
+) -> Dict[str, object]:
+    path = _run_dir(run_id) / CALIBRATION_FILENAME
+    existed = path.exists()
+    if existed:
+        path.unlink()
+    return {"run_id": run_id, "calibration": None, "deleted": existed}
 
 
 # ---------------------------------------------------------------------------

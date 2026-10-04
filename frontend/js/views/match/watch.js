@@ -3,6 +3,7 @@
 
 import { icon } from '../../icons.js';
 import { $, esc, openDrawer } from '../../ui.js';
+import { createCalibrator } from './calibrate.js';
 import { createEventList } from './events.js';
 import { createPicker } from './picker.js';
 import { createPlayer } from './player.js';
@@ -13,8 +14,8 @@ const PREROLL = 3;
 const SHORTCUTS = [
   ['Space / K', 'Play / pause'], ['J / ←', 'Back 5 s (Shift: 15 s)'], ['L / →', 'Forward 5 s (Shift: 15 s)'],
   [', / .', 'Previous / next frame'], ['N / P', 'Next / previous event'], ['1 – 9', 'Jump to event 1–9 in the list'],
-  ['T', 'Pick a player'], ['G / W', 'Game camera / wide view'], ['M', 'Mute'], ['F', 'Fullscreen'],
-  ['[ / ]', 'Slower / faster'], ['Esc', 'Leave pick mode'], ['?', 'This sheet'],
+  ['T', 'Pick a player'], ['C', 'Calibrate pitch (click the 4 corners)'], ['Z', 'Undo last corner (calibration)'], ['G / W', 'Game camera / wide view'], ['M', 'Mute'], ['F', 'Fullscreen'],
+  ['[ / ]', 'Slower / faster'], ['Esc', 'Leave pick / calibration mode'], ['?', 'This sheet'],
 ];
 
 function showShortcuts() {
@@ -27,11 +28,12 @@ function showShortcuts() {
 export function renderWatchTab(body, ctx, options = {}) {
   const model = ctx.model;
   body.innerHTML = `<div class="watch">
-    <div class="stage-col"><div id="playerbox"></div><div id="tlbox"></div></div>
+    <div class="stage-col"><div id="playerbox"></div><div id="calbox" hidden></div><div id="tlbox"></div></div>
     <div id="evbox"></div></div>`;
 
   let timeline = null;
   let picker = null;
+  let calib = null;
   const player = createPlayer($('#playerbox', body), model, { initial: ctx.lastSource });
   const events = createEventList($('#evbox', body), ctx, {
     onPlay: (e) => { picker?.stop(); player.seekWindow(e.t_start != null ? e.t_start + PREROLL : e.t, { play: true, preroll: PREROLL }); },
@@ -42,7 +44,8 @@ export function renderWatchTab(body, ctx, options = {}) {
     onEvent: (e) => { picker.stop(); player.seekWindow(e.t_start != null ? e.t_start + PREROLL : e.t, { play: true, preroll: PREROLL }); },
   });
   timeline.setFilter(new Set(events.visible.map((e) => e.id)));
-  picker = createPicker(ctx, player, { onFilterEvents: (tid) => events.setPlayerFilter(tid) });
+  picker = createPicker(ctx, player, { onFilterEvents: (tid) => events.setPlayerFilter(tid), onStart: () => calib?.stop() });
+  calib = createCalibrator(ctx, player, { box: $('#calbox', body), onStart: () => picker.stop() });
   player.extra.insertAdjacentHTML('beforeend',
     `<button class="iconbtn" id="kbdhelp" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">${icon('keyboard')}</button>`);
   $('#kbdhelp', player.extra).onclick = showShortcuts;
@@ -52,6 +55,7 @@ export function renderWatchTab(body, ctx, options = {}) {
     ctx.lastSource = src.key;
     timeline.setActive(src.timebase === 'window', src.timebase === 'window' ? '' : 'Reel/clip has its own clock — markers apply to Game camera and Wide');
     if (src.timebase !== 'window') picker.stop();
+    if (!src.wide) calib.stop();
   });
   if (player.source) timeline.setActive(player.source.timebase === 'window');
 
@@ -67,6 +71,7 @@ export function renderWatchTab(body, ctx, options = {}) {
     if (event.target.closest('input, select, textarea, [contenteditable]') || event.metaKey || event.ctrlKey || event.altKey) return;
     if (document.querySelector('.scrim')) return;
     const k = event.key;
+    if (calib.active && ['z', 'Z', 'Backspace'].includes(k)) { event.preventDefault(); calib.undo(); return; }
     const big = event.shiftKey ? 15 : 5;
     const handled = {
       ' ': () => player.toggle(), k: () => player.toggle(), K: () => player.toggle(),
@@ -75,12 +80,13 @@ export function renderWatchTab(body, ctx, options = {}) {
       ',': () => player.step(-1), '.': () => player.step(1), '<': () => player.step(-1), '>': () => player.step(1),
       n: () => step(1), N: () => step(1), p: () => step(-1), P: () => step(-1),
       t: () => picker.toggle(), T: () => picker.toggle(),
+      c: () => calib.toggle(), C: () => calib.toggle(),
       m: () => player.toggleMute(), M: () => player.toggleMute(), f: () => player.fullscreen(), F: () => player.fullscreen(),
       g: () => player.setSource('movie'), G: () => player.setSource('movie'), w: () => player.setSource('wide'), W: () => player.setSource('wide'),
       '[': () => player.setRate(Math.max(0.25, player.video.playbackRate / 2)),
       ']': () => player.setRate(Math.min(2, player.video.playbackRate * 2)),
       '?': showShortcuts,
-      Escape: () => picker.stop(),
+      Escape: () => { picker.stop(); calib.stop(); },
     }[k];
     if (handled) { event.preventDefault(); handled(); return; }
     if (/^[1-9]$/.test(k)) {
@@ -93,6 +99,8 @@ export function renderWatchTab(body, ctx, options = {}) {
   const onLabels = () => events.refresh();
   window.addEventListener('vh-labels-changed', onLabels);
 
+  if (options.calibrate) calib.start();
+
   if (options.seek != null) {
     player.video.addEventListener('loadedmetadata', () => player.seekWindow(options.seek, { play: true, preroll: PREROLL }), { once: true });
   }
@@ -101,6 +109,7 @@ export function renderWatchTab(body, ctx, options = {}) {
     document.removeEventListener('keydown', onKey);
     window.removeEventListener('vh-labels-changed', onLabels);
     picker.destroy();
+    calib.destroy();
     timeline.destroy();
     player.destroy();
   };

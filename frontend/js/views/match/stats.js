@@ -4,6 +4,7 @@
 
 import { get } from '../../api.js';
 import { donut, momentumChart, possessionBars, stackBar } from '../../charts.js';
+import { calibrationMapper } from '../../homography.js';
 import { icon } from '../../icons.js';
 import { eventLocation, PITCH, pitchSvg } from '../../pitch.js';
 import { playerName, qualityFlags, teamColor, teamName } from '../../runmodel.js';
@@ -105,9 +106,10 @@ function territoryPanel(model) {
 function shotMap(model) {
   const shots = model.events.filter((e) => ['shot', 'goal', 'save', 'chance'].includes(e.type));
   const placed = [];
+  const mapper = calibrationMapper(model);
   let mode = null;
   for (const e of shots) {
-    const loc = eventLocation(e, model.calibration, model.frame);
+    const loc = eventLocation(e, mapper, model.frame);
     if (!loc) continue;
     mode = mode === 'image' || loc.mode === 'image' ? 'image' : loc.mode;
     placed.push({ e, x: Math.max(0, Math.min(PITCH.L, loc.xy[0])), y: Math.max(0, Math.min(PITCH.W, loc.xy[1])) });
@@ -119,13 +121,33 @@ function shotMap(model) {
       ${e.type === 'goal' ? `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${r + 1}" fill="none" stroke="#fff" stroke-width="0.25" opacity=".8"/>` : ''}
       <title>${esc(e.info.label)} · ${esc(teamName(model, e.team))} · ${fmtClock(e.t)}</title></g>`;
   }).join('');
+  const pending = model.calibration?.source !== 'manual';
   const note = mode === 'image' ? 'Image-space positions (no pitch calibration) — approximate.'
-    : mode === 'calibrated' ? 'Projected through the pitch calibration.' : '';
+    : mode === 'manual' ? `Projected through your manual pitch calibration${pending ? ' (re-analyze to update the metres-based stats too)' : ''}.`
+      : mode === 'calibrated' ? `Projected through the ${model.calibration?.source || 'auto'} pitch calibration.` : '';
   return `<div class="panel"><div class="charthead"><div class="panel-title" style="margin:0">Shot map</div>
     <div class="legend-inline"><span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="var(--text-2)"/></svg>Goal</span>
     <span><svg width="12" height="12"><circle cx="6" cy="6" r="4" fill="none" stroke="var(--text-2)" stroke-width="1.5"/></svg>Shot / chance</span></div></div>
     ${placed.length ? pitchSvg(dots, { label: 'Shot map' }) : `<div class="empty" style="padding:32px">${shots.length ? 'Shots were detected but carry no location.' : 'No shots detected.'}</div>`}
     ${note ? `<div class="note">${esc(note)}</div>` : ''}</div>`;
+}
+
+// Calibration badge: what the analysis used (analysis_player_stats.pitch_calibration)
+// plus a shortcut into the Watch tab's calibration mode when it was not manual.
+function calibrationBadge(model) {
+  const cal = model.calibration;
+  const saved = model.manualCalibration;
+  const source = cal?.source || null;
+  const conf = cal?.confidence != null ? +cal.confidence : null;
+  const level = conf == null ? 'danger' : conf >= 0.75 ? 'ok' : conf >= 0.45 ? 'warn' : 'danger';
+  const label = cal ? `Pitch calibration · ${source === 'manual' ? 'manual' : 'auto'}${conf != null ? ` ${Math.round(conf * 100)}%` : ''}` : 'No pitch calibration';
+  const tip = source === 'manual' ? 'Metres come from the pitch corners you clicked.'
+    : 'Estimated from player spread. Click the 4 pitch corners for accurate distances, speeds, passes and goal detection.';
+  const pending = saved && source !== 'manual';
+  const canWatch = model.sources.some((s) => s.wide);
+  return `<span class="calbadge"><span class="badge ${level}" id="calbadge" title="${esc(tip)}"><span class="dot"></span>${esc(label)}</span>
+    ${pending ? `<span class="badge info" title="Saved ${esc(saved.updated_at || '')}">Manual corners saved · re-analyze to apply</span>` : ''}
+    ${source !== 'manual' && canWatch ? `<button class="btn-ghost sm" id="calgo">${icon('pitch', 'sm')} ${pending ? 'Review calibration' : 'Calibrate'}</button>` : ''}</span>`;
 }
 
 /* ---------------- stat catalog (DB-derived match sheet) ---------------- */
@@ -247,10 +269,10 @@ function playerTable(ctx, box) {
 
 export function renderStatsTab(body, ctx) {
   const model = ctx.model;
-  const flags = qualityFlags(model);
+  const flags = qualityFlags(model).filter((f) => f.key !== 'calibration');
   body.innerHTML = `
     <div class="charthead" style="margin-bottom:16px">
-      <div class="quality">${flags.map((f) => `<span class="badge ${f.level}" title="${esc(f.tip)}"><span class="dot"></span>${esc(f.label)}</span>`).join('')}</div>
+      <div class="quality">${calibrationBadge(model)}${flags.map((f) => `<span class="badge ${f.level}" title="${esc(f.tip)}"><span class="dot"></span>${esc(f.label)}</span>`).join('')}</div>
       <div class="faint xs">${model.teamStats.version ? `Team stats v${model.teamStats.version}` : 'No team stats artifact'} · ${model.players.size} players</div>
     </div>
     <div class="cols-split">
@@ -262,6 +284,8 @@ export function renderStatsTab(body, ctx) {
     ${ctx.matchId ? '<div class="panel" id="catalog"><div class="panel-title">Match sheet</div><div class="sk sk-line"></div><div class="sk sk-line"></div></div>' : ''}
     <div class="panel" id="ptable"></div>`;
   playerTable(ctx, $('#ptable', body));
+  const calgo = $('#calgo', body);
+  if (calgo) calgo.onclick = () => { window.scrollTo(0, 0); ctx.switchTab('watch', { calibrate: true }); };
   if (ctx.matchId) loadCatalog(ctx, $('#catalog', body));
   const onLabels = () => playerTable(ctx, $('#ptable', body));
   window.addEventListener('vh-labels-changed', onLabels);
