@@ -1,6 +1,9 @@
 name: docker-publish
 
-# Builds and pushes the images on version tags (and on demand).
+# Builds and pushes the images on every push to main, on version tags, and
+# on demand. A main push refreshes the moving tags (latest / gpu / gpu-arm64)
+# plus a sha-<commit> tag; a v* tag additionally publishes <tag> and
+# <major>.<minor> tags.
 #
 #   <image>:<tag>            CPU image, linux/amd64 + linux/arm64
 #   <image>:<tag>-gpu        NVIDIA image, linux/amd64, CUDA 12.8 wheels (RTX 30/40/50)
@@ -13,6 +16,7 @@ name: docker-publish
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -89,7 +93,7 @@ jobs:
             type=ref,event=tag
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
-            type=raw,value=${{ matrix.moving }},suffix=,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ matrix.moving }},suffix=,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
