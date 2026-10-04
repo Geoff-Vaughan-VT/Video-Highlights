@@ -1,6 +1,29 @@
+"""Player selection and identity stitching.
+
+* :func:`resolve_player_roi_box` / :func:`choose_target_track_id` /
+  :func:`stitch_target_track`: legacy helpers working on ``TrackPoint``-like
+  objects (``.t``, ``.xy``, ``.bbox``); still used by ``VideoHighlights``.
+* :func:`stitch_tracks`: whole-match re-identification. Links tracker
+  fragments into identities using motion continuity *and* an appearance
+  embedding (torso colour histogram). Candidates are found with a sorted
+  start-time index and a bounded gap window, so the cost is
+  ``O(n log n + k)`` for ``n`` fragments and ``k`` candidate pairs instead of
+  the all-pairs, per-step scan of :func:`stitch_target_track`.
+* :func:`select_track_at`: pick the identity under a user-drawn box at a
+  given time (the "track this player" picker).
+"""
+
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Tuple
+import bisect
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+
+logger = logging.getLogger("videohighlights.player_focus")
 
 
 def resolve_player_roi_box(
@@ -251,3 +274,238 @@ def stitch_target_track(
 
     stitched.sort(key=_point_time)
     return stitched_ids, stitched
+
+
+# ----------------------------------------------------------------------
+# Whole-match identity stitching (motion + appearance)
+# ----------------------------------------------------------------------
+
+Box = Tuple[float, float, float, float]
+
+
+@dataclass
+class TrackFragment:
+    """Summary of one raw tracker ID used for stitching.
+
+    ``start_vel``/``end_vel`` are box-center velocities (px/s) estimated over
+    the first/last ~0.5 s. ``appearance`` is an L1-normalised colour
+    histogram (or ``None`` when unavailable). ``team`` (when known, >= 0)
+    forbids links across teams.
+    """
+
+    track_id: int
+    t_start: float
+    t_end: float
+    start_box: Box
+    end_box: Box
+    start_vel: Tuple[float, float] = (0.0, 0.0)
+    end_vel: Tuple[float, float] = (0.0, 0.0)
+    appearance: Optional[np.ndarray] = None
+    samples: int = 0
+    team: int = -1
+    #: appearance from the first / last few samples (preferred for linking,
+    #: robust to a fragment drifting onto another player later on)
+    start_appearance: Optional[np.ndarray] = None
+    end_appearance: Optional[np.ndarray] = None
+
+    @property
+    def duration_s(self) -> float:
+        return max(0.0, self.t_end - self.t_start)
+
+
+@dataclass
+class StitchLink:
+    """An accepted ``prev -> next`` link with its evidence (for logs/debug)."""
+
+    prev_id: int
+    next_id: int
+    gap_s: float
+    distance_px: float
+    radius_px: float
+    appearance_sim: Optional[float]
+    cost: float
+
+
+@dataclass
+class StitchResult:
+    chains: List[List[int]]
+    links: List[StitchLink] = field(default_factory=list)
+    candidates_considered: int = 0
+
+
+def appearance_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    """Bhattacharyya coefficient of two L1-normalised histograms (1 = identical)."""
+    if a is None or b is None:
+        return None
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    if a.shape != b.shape or a.sum() <= 0 or b.sum() <= 0:
+        return None
+    a = a / a.sum()
+    b = b / b.sum()
+    return float(np.sqrt(a * b).sum())
+
+
+def _center(box: Box) -> Tuple[float, float]:
+    return (float(box[0]) + float(box[2])) * 0.5, (float(box[1]) + float(box[3])) * 0.5
+
+
+def _height(box: Box) -> float:
+    return max(1.0, float(box[3]) - float(box[1]))
+
+
+def stitch_tracks(
+    fragments: Sequence[TrackFragment],
+    *,
+    max_gap_s: float = 3.0,
+    overlap_tolerance_s: float = 0.2,
+    base_radius_heights: float = 1.2,
+    speed_heights_per_s: float = 4.0,
+    max_extrapolate_s: float = 1.0,
+    max_size_ratio: float = 1.8,
+    min_appearance_sim: float = 0.55,
+    appearance_weight: float = 0.5,
+    return_details: bool = False,
+):
+    """Link tracker fragments into identities.
+
+    A link ``a -> b`` is a candidate when ``b`` starts within
+    ``[a.t_end - overlap_tolerance_s, a.t_end + max_gap_s]``, ``b``'s first
+    box center lies within a radius of ``a``'s last box center extrapolated
+    with ``a``'s velocity (radius grows with the gap: ``h * (base +
+    speed * gap)`` where ``h`` is the box height, i.e. a scale-free
+    "player heights per second" speed bound), box heights agree within
+    ``max_size_ratio``, teams agree when both known, and appearance
+    similarity (``a``'s end vs ``b``'s start embedding, falling back to the
+    whole-fragment means) is at least ``min_appearance_sim`` when both have
+    one. Candidates are accepted greedily by ascending cost
+    (normalised distance blended with appearance dissimilarity), each
+    fragment getting at most one predecessor and one successor.
+
+    Complexity: fragments are sorted by start time once and each fragment's
+    candidates are found with :func:`bisect` over the start times, so the
+    work is ``O(n log n + k log k)`` for ``k`` candidate pairs.
+
+    Returns:
+        ``List[List[int]]`` chains of track ids in time order (every input id
+        appears exactly once), or a :class:`StitchResult` when
+        ``return_details`` is true.
+    """
+    frags = [f for f in fragments if f.samples > 0 or f.t_end >= f.t_start]
+    by_start = sorted(frags, key=lambda f: (f.t_start, f.track_id))
+    starts = [f.t_start for f in by_start]
+    w_app = min(1.0, max(0.0, float(appearance_weight)))
+
+    candidates: List[Tuple[float, int, int, StitchLink]] = []
+    considered = 0
+    for a in frags:
+        lo = bisect.bisect_left(starts, a.t_end - overlap_tolerance_s)
+        hi = bisect.bisect_right(starts, a.t_end + max_gap_s)
+        if lo >= hi:
+            continue
+        ax, ay = _center(a.end_box)
+        ah = _height(a.end_box)
+        for b in by_start[lo:hi]:
+            if b.track_id == a.track_id or b.t_end <= a.t_end:
+                continue
+            considered += 1
+            if a.team >= 0 and b.team >= 0 and a.team != b.team:
+                continue
+            gap = b.t_start - a.t_end
+            bh = _height(b.start_box)
+            if max(ah, bh) / min(ah, bh) > max_size_ratio:
+                continue
+            g = min(max(0.0, gap), max_extrapolate_s)
+            px = ax + a.end_vel[0] * g
+            py = ay + a.end_vel[1] * g
+            bx, by = _center(b.start_box)
+            dist = math.hypot(bx - px, by - py)
+            h = 0.5 * (ah + bh)
+            radius = h * (base_radius_heights + speed_heights_per_s * max(0.0, gap))
+            if dist > radius:
+                continue
+            a_app = a.end_appearance if a.end_appearance is not None else a.appearance
+            b_app = b.start_appearance if b.start_appearance is not None else b.appearance
+            sim = appearance_similarity(a_app, b_app)
+            if sim is not None and sim < min_appearance_sim:
+                continue
+            motion_cost = dist / max(radius, 1e-6)
+            if sim is None:
+                cost = motion_cost
+            else:
+                cost = (1.0 - w_app) * motion_cost + w_app * (1.0 - sim) / max(1e-6, 1.0 - min_appearance_sim)
+            cost += 0.1 * max(0.0, gap) / max(max_gap_s, 1e-6)
+            link = StitchLink(a.track_id, b.track_id, gap, dist, radius, sim, cost)
+            candidates.append((cost, a.track_id, b.track_id, link))
+
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    successor: Dict[int, int] = {}
+    predecessor: Dict[int, int] = {}
+    accepted: List[StitchLink] = []
+    for _cost, a_id, b_id, link in candidates:
+        if a_id in successor or b_id in predecessor:
+            continue
+        successor[a_id] = b_id
+        predecessor[b_id] = a_id
+        accepted.append(link)
+
+    chains: List[List[int]] = []
+    for f in by_start:
+        if f.track_id in predecessor:
+            continue
+        chain = [f.track_id]
+        while chain[-1] in successor:
+            chain.append(successor[chain[-1]])
+        chains.append(chain)
+    if accepted:
+        logger.debug("stitch_tracks: %d fragments -> %d identities (%d links, %d candidates)",
+                     len(frags), len(chains), len(accepted), considered)
+    if return_details:
+        return StitchResult(chains=chains, links=accepted, candidates_considered=considered)
+    return chains
+
+
+def select_track_at(
+    tracks: Mapping[int, object],
+    box: Box,
+    t: float = 0.0,
+    *,
+    window_s: float = 0.5,
+    max_center_distance_boxes: float = 1.5,
+) -> Optional[int]:
+    """Pick the track whose box best matches ``box`` near time ``t``.
+
+    ``tracks`` maps id -> object with aligned float arrays ``t, x1, y1, x2,
+    y2`` (e.g. :class:`~backend.services.tracking_types.PlayerTrack`). For
+    each track the sample nearest ``t`` within ``window_s`` is compared to
+    ``box``; ranking is (IoU, center-inside, -center distance). Tracks with no
+    overlap whose center is further than ``max_center_distance_boxes`` box
+    diagonals from the ROI center are ignored. Returns ``None`` when nothing
+    qualifies.
+    """
+    ux = (box[0] + box[2]) * 0.5
+    uy = (box[1] + box[3]) * 0.5
+    diag = math.hypot(box[2] - box[0], box[3] - box[1])
+    best_id: Optional[int] = None
+    best_score: Optional[Tuple[float, float, float]] = None
+    for track_id, track in tracks.items():
+        ts = np.asarray(getattr(track, "t", ()), dtype=np.float64)
+        if ts.size == 0:
+            continue
+        idx = int(np.searchsorted(ts, t))
+        options = [i for i in (idx - 1, idx) if 0 <= i < ts.size]
+        i = min(options, key=lambda k: abs(ts[k] - t))
+        if abs(ts[i] - t) > window_s:
+            continue
+        cand = (float(track.x1[i]), float(track.y1[i]), float(track.x2[i]), float(track.y2[i]))
+        iou = box_iou(box, cand)
+        cx, cy = _center(cand)
+        inside = 1.0 if (box[0] <= cx <= box[2] and box[1] <= cy <= box[3]) else 0.0
+        dist = math.hypot(cx - ux, cy - uy)
+        if iou <= 0.0 and inside == 0.0 and dist > max_center_distance_boxes * max(diag, 1.0):
+            continue
+        score = (iou, inside, -dist)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_id = int(track_id)
+    return best_id
