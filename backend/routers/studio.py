@@ -437,9 +437,15 @@ def _job_lookup(session: Optional[Session], tenant_id: Optional[str], run: Path)
 
 
 def _job_output_dir(job: ProcessingJob) -> Path:
+    # The runner always writes to <output_root>/<job_id>; the recorded result
+    # path wins for completed jobs, and config.output_dir (legacy rows only)
+    # is consulted last so Studio looks where the runner actually wrote.
     config = dict(job.config_json or {})
     result = dict(job.result_json or {})
-    raw = config.get("output_dir") or result.get("output_dir") or os.path.join(settings.output_root, job.id)
+    default_dir = os.path.join(settings.output_root, job.id)
+    raw = result.get("output_dir") or default_dir
+    if not Path(str(raw)).expanduser().exists() and config.get("output_dir"):
+        raw = config.get("output_dir")
     try:
         return Path(str(raw)).expanduser().resolve()
     except Exception:

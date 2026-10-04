@@ -379,3 +379,143 @@ def test_debug_wide_renders_from_proxy_source(tmp_path, quadrant_source) -> None
     # Crop rectangle drawn in scaled coordinates: the red quadrant's crop box
     # outline (state colour green-ish) sits inside the top-left quadrant.
     assert float(frames[10][0:20, :].mean()) > 1.0
+
+
+# ---------------------------------------------------------------------------
+# Scorebug attribution, rotated sources, cancel
+# ---------------------------------------------------------------------------
+
+
+def test_scorebug_credits_scoring_team_across_half_time_swap() -> None:
+    # HOME (team 0, left label) attacks the right goal in the first half and
+    # the LEFT goal after the half-time swap; AWAY (team 1) the opposite.
+    goals = [
+        {"t": 600.0, "side": "right", "team": 0},   # 1H: HOME into the right goal
+        {"t": 3300.0, "side": "left", "team": 0},   # 2H: HOME into the left goal
+        {"t": 4000.0, "side": "right", "team": 1},  # 2H: AWAY into the right goal
+    ]
+    bug = make_scorebug_renderer(goals, team_left="HOME", team_right="AWAY")
+    assert bug.score_at(0.0) == (0, 0)
+    assert bug.score_at(700.0) == (1, 0)
+    assert bug.score_at(3400.0) == (2, 0)  # side-only attribution would say (1, 1)
+    assert bug.score_at(4100.0) == (2, 1)
+    # Unknown team: the goal side decides (into the left goal -> right label).
+    legacy = make_scorebug_renderer([{"t": 10.0, "side": "left", "team": None},
+                                     {"t": 20.0, "side": "right"}])
+    assert legacy.score_at(30.0) == (1, 1) and legacy.score_at(15.0) == (0, 1)
+    # The drawtext text files follow the same score.
+    import tempfile
+    from pathlib import Path as _P
+
+    with tempfile.TemporaryDirectory() as work:
+        bug.ffmpeg_filters(_P(work), "t", 3350.0, 10.0, (640, 360), None)
+        texts = [p.read_text() for p in sorted(_P(work).glob("sb_t_*.txt"))]
+    assert any("HOME 2 - 0 AWAY" in t for t in texts), texts
+
+
+@needs_ffmpeg
+def test_ffmpeg_render_handles_rotated_source(tmp_path, quadrant_source) -> None:
+    rotated = tmp_path / "rotated.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-display_rotation", "90",
+                    "-i", str(quadrant_source), "-c", "copy", str(rotated)], check=True)
+    info = probe_video(str(rotated))
+    assert (info.width, info.height) == (QH, QW)  # display orientation (portrait)
+
+    # Plan in display pixels (360x640), zoom 2 around a point in the lower half.
+    dw, dh = QH, QW
+    plan = CameraPlan(start_seconds=1.0, fps=QFPS, frame_size=(dw, dh), base_zoom=2.0, output_size=(160, 90))
+    for i in range(25):
+        plan.decisions.append(CameraDecision(index=i, t=1.0 + i / QFPS, center_x=dw * 0.25, center_y=dh * 0.75,
+                                             zoom=2.0, state="in_play", focus="ball", reason="t", confidence=1.0))
+    output = tmp_path / "rotated_follow.mp4"
+    render_camera_plan_video(video_path=str(rotated), output_path=str(output), plan=plan, include_audio=False)
+    out_info = probe_video(str(output))
+    assert (out_info.width, out_info.height) == (160, 90)
+    frames = _frames(output)
+    assert abs(len(frames) - len(plan)) <= 1
+
+    # Expected content: the same crop of the autorotated (display) frame.
+    cap = cv2.VideoCapture(str(rotated))
+    ok, display = cap.read()
+    cap.release()
+    assert ok and display.shape[:2] == (dh, dw)
+    x, y, w, h = (int(v) for v in plan.get_crop_rects()[0])
+    expected = display[y:y + h, x:x + w].reshape(-1, 3).mean(axis=0)
+    got = frames[0].reshape(-1, 3).mean(axis=0)
+    assert np.abs(expected - got).max() < 30, (expected, got)
+
+
+@needs_ffmpeg
+def test_chunked_render_cancel_stops_queued_chunks(tmp_path, quadrant_source, monkeypatch) -> None:
+    import threading
+
+    from backend.services import camera_render as cr
+
+    plan = _quadrant_plan(start=0.5, seconds=6.0, jump_at=99.0)
+    cancel = threading.Event()
+    spawns: list = []
+    lock = threading.Lock()
+    original_popen = subprocess.Popen
+
+    class CountingPopen(original_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, args, *a, **kw):
+            if isinstance(args, (list, tuple)) and "-progress" in [str(x) for x in args]:
+                with lock:
+                    spawns.append((time.monotonic(), cancel.is_set()))
+            super().__init__(args, *a, **kw)
+
+    first_chunk = int(round(1.0 * QFPS))
+    cancelled_at: list = []
+
+    def on_info(info) -> None:
+        if not cancel.is_set() and info["frame"] >= first_chunk:
+            cancelled_at.append(time.monotonic())
+            cancel.set()
+
+    monkeypatch.setattr(subprocess, "Popen", CountingPopen)
+    with pytest.raises(cr.RenderCancelled):
+        render_camera_plan_video(video_path=str(quadrant_source), output_path=str(tmp_path / "c.mp4"), plan=plan,
+                                 include_audio=True, chunk_seconds=1.0, workers=2, progress_info_callback=on_info,
+                                 cancel_event=cancel)
+    returned = time.monotonic()
+    assert cancelled_at, "the first chunk never completed"
+    assert len(spawns) == 1, spawns  # only the first chunk's ffmpeg ever ran
+    assert not any(after for _, after in spawns)
+    assert returned - cancelled_at[0] < 2.0
+    assert not (tmp_path / "c.mp4").exists()
+    assert not list(tmp_path.glob(".c_render_*"))  # work dir cleaned up
+
+    # Already-set cancel: nothing is spawned at all.
+    spawns.clear()
+    with pytest.raises(cr.RenderCancelled):
+        render_camera_plan_video(video_path=str(quadrant_source), output_path=str(tmp_path / "d.mp4"), plan=plan,
+                                 include_audio=False, chunk_seconds=1.0, workers=2, cancel_event=cancel)
+    assert spawns == []
+
+
+@needs_ffmpeg
+def test_chunked_render_failure_stops_queued_chunks(tmp_path, quadrant_source, monkeypatch) -> None:
+    import threading
+
+    from backend.services import camera_render as cr
+
+    plan = _quadrant_plan(start=0.5, seconds=6.0, jump_at=99.0)
+    original = cr._run_ffmpeg
+    calls: list = []
+    lock = threading.Lock()
+
+    def flaky(cmd, cwd, on_frames=None, stall_timeout_s=None):
+        target = str(cmd[-1])
+        with lock:
+            calls.append(target)
+        if target.startswith("chunk_0002"):
+            return 1, "simulated encoder crash"
+        return original(cmd, cwd, on_frames, stall_timeout_s=stall_timeout_s)
+
+    monkeypatch.setattr(cr, "_run_ffmpeg", flaky)
+    with pytest.raises(RuntimeError, match="simulated encoder crash"):
+        render_camera_plan_video(video_path=str(quadrant_source), output_path=str(tmp_path / "f.mp4"), plan=plan,
+                                 include_audio=False, chunk_seconds=1.0, workers=1)
+    # Sequential: chunks after the failing one (3..5) never start; the failing
+    # chunk tries its fallback combinations only.
+    assert not any(c.startswith(("chunk_0003", "chunk_0004", "chunk_0005")) for c in calls), calls

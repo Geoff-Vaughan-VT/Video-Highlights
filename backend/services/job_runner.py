@@ -423,35 +423,114 @@ def _sync_job_events_from_manifest(
     return created
 
 
+class JobSetupError(RuntimeError):
+    """A job cannot start (bad source path, unusable reuse source...); the
+    message is user-facing and becomes ``job.error_message``."""
+
+
 def _job_output_dir(job: ProcessingJob, config: Dict[str, Any], reuse_dir: Optional[str] = None) -> str:
-    """``config.output_dir`` or ``<output_root>/<job id>``; never the reused run's folder."""
-    output_dir = str(config.get("output_dir") or os.path.join(settings.output_root, job.id))
+    """``<output_root>/<job id>``; never the reused run's folder.
+
+    ``config.output_dir`` is honoured only with ``VH_ALLOW_OUTPUT_DIR_OVERRIDE``
+    (test suites); legacy rows that stored one are ignored, so ``build_proxy``
+    (which clears ``<output_dir>/thumbs``) only ever touches this job's folder.
+    """
+    from ..schemas import output_dir_override_allowed
+
+    default = os.path.join(settings.output_root, job.id)
+    output_dir = str(config.get("output_dir") or default) if output_dir_override_allowed() else default
     if reuse_dir and os.path.abspath(output_dir) == os.path.abspath(reuse_dir):
-        output_dir = os.path.join(settings.output_root, job.id)
+        output_dir = default
     return output_dir
 
 
+def _resolve_video_path(config: Dict[str, Any], match: Match) -> str:
+    """The job's source video, checked against the media-root policy."""
+    from ..schemas import check_media_path
+
+    raw = str(config.get("video_path") or match.source_video_path or "").strip()
+    if not raw:
+        raise JobSetupError("Match has no source video path")
+    try:
+        return str(check_media_path(raw, field="video_path"))
+    except ValueError as exc:
+        raise JobSetupError(f"Video path rejected: {exc}") from exc
+
+
 def _resolve_reuse_dir(session, job: ProcessingJob, reuse_job_id: Optional[object]) -> Optional[str]:
-    """Run directory of ``reuse_tracking_from_job`` (same tenant) when it holds tracks."""
+    """Run directory of ``reuse_tracking_from_job`` (same tenant, inside the
+    output root) holding ``tracks.npz``; raises :class:`JobSetupError` otherwise.
+
+    Never falls back to a bare ``<output_root>/<id>`` without a DB row: the
+    id must name a job of this tenant.
+    """
     if not reuse_job_id:
         return None
+    from ..schemas import _is_within, is_valid_job_id, output_dir_override_allowed
     from .tracking_types import TrackingResult
 
-    reuse_id = str(reuse_job_id)
-    candidates: List[str] = []
+    reuse_id = str(reuse_job_id).strip()
+    if not is_valid_job_id(reuse_id):
+        raise JobSetupError("reuse_tracking_from_job must be a job id")
     source = session.get(ProcessingJob, reuse_id)
-    if source is not None and source.tenant_id == job.tenant_id:
-        cfg = dict(source.config_json or {})
-        res = dict(source.result_json or {})
-        for value in (cfg.get("output_dir"), res.get("output_dir")):
-            if value:
-                candidates.append(str(value))
-    if source is None or source.tenant_id == job.tenant_id:
-        candidates.append(os.path.join(settings.output_root, reuse_id))
+    if source is None or source.tenant_id != job.tenant_id:
+        raise JobSetupError(f"reuse_tracking_from_job not found: {reuse_id}")
+    if source.id == job.id:
+        raise JobSetupError("reuse_tracking_from_job cannot be the job itself")
+    root = Path(settings.output_root).expanduser().resolve()
+    res = dict(source.result_json or {})
+    cfg = dict(source.config_json or {})
+    candidates: List[str] = []
+    if res.get("output_dir"):
+        candidates.append(str(res["output_dir"]))
+    if output_dir_override_allowed() and cfg.get("output_dir"):
+        candidates.append(str(cfg["output_dir"]))
+    candidates.append(os.path.join(settings.output_root, source.id))
     for cand in candidates:
-        if TrackingResult.exists(cand):
-            return str(Path(cand).resolve())
+        resolved = Path(cand).expanduser().resolve()
+        if not output_dir_override_allowed() and (resolved == root or not _is_within(resolved, root)):
+            continue
+        if TrackingResult.exists(str(resolved)):
+            return str(resolved)
+    raise JobSetupError(
+        f"reuse_tracking_from_job {reuse_id} has no reusable tracks (tracks.npz) in its run folder"
+    )
+
+
+def _fail_job_setup(session, job: ProcessingJob, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+    job.status = "failed"
+    job.stage = "failed"
+    job.progress = 1.0
+    job.error_message = message
+    job.updated_at = _utcnow()
+    job.completed_at = _utcnow()
+    session.add(job)
+    append_job_log(
+        session=session,
+        job_id=job.id,
+        tenant_id=job.tenant_id,
+        level="error",
+        stage="failed",
+        message=message,
+        detail_level="basic",
+        data=dict(data or {}),
+    )
+    notify_job_terminal_state(session, job)
+
+
+def _failure_reason_from_progress(output_dir: str) -> Optional[str]:
+    """``progress.json`` message of a failed run (fallback when the engine
+    progress callback never delivered a failure reason)."""
+    payload = _read_json_file(Path(output_dir) / "progress.json")
+    if str(payload.get("status") or payload.get("stage") or "").lower() == "failed":
+        message = str(payload.get("message") or "").strip()
+        return message or None
     return None
+
+
+#: Persist an unchanged engine heartbeat as a job-log row at most this often
+#: (job.progress is still updated on every heartbeat).
+HEARTBEAT_LOG_INTERVAL_S = 30.0
 
 
 class JobRunner:
@@ -563,8 +642,13 @@ class JobRunner:
                 )
 
                 config = job.config_json or {}
-                video_path = config.get("video_path") or match.source_video_path
-                reuse_dir = _resolve_reuse_dir(session, job, config.get("reuse_tracking_from_job"))
+                try:
+                    video_path = _resolve_video_path(config, match)
+                    reuse_dir = _resolve_reuse_dir(session, job, config.get("reuse_tracking_from_job"))
+                except JobSetupError as setup_error:
+                    _fail_job_setup(session, job, str(setup_error),
+                                    {"reuse_tracking_from_job": config.get("reuse_tracking_from_job")})
+                    return
                 output_dir = _job_output_dir(job, config, reuse_dir)
                 ensure_dir(output_dir)
                 _append_process_log(
@@ -711,8 +795,12 @@ class JobRunner:
                     )
                     return
 
-                video_path = config.get("video_path") or match.source_video_path
-                reuse_dir = _resolve_reuse_dir(session, job, config.get("reuse_tracking_from_job"))
+                try:
+                    video_path = _resolve_video_path(config, match)
+                    reuse_dir = _resolve_reuse_dir(session, job, config.get("reuse_tracking_from_job"))
+                except JobSetupError as setup_error:
+                    _fail_job_setup(session, job, str(setup_error))
+                    return
                 output_dir = _job_output_dir(job, config, reuse_dir)
                 gpu_status = get_gpu_status()
                 _append_process_log(
@@ -823,9 +911,13 @@ class JobRunner:
 
             progress_state: Dict[str, Any] = {
                 "last_at": None,
+                "last_log_at": None,
                 "last_progress": 0.0,
+                "last_logged_progress": 0.0,
                 "last_sub_stage": "",
                 "last_message": "",
+                "final_logged": False,
+                "failure": None,
             }
 
             def _record_engine_progress(
@@ -837,23 +929,33 @@ class JobRunner:
                 _poll_cancel()
                 stage_key = str(sub_stage or "processing").strip().lower()
                 message_text = str(message or stage_key).strip()
+                if stage_key == "failed":
+                    # Keep the engine's own reason for job.error_message.
+                    reason = (data or {}).get("error") if isinstance(data, dict) else None
+                    reason_text = str(reason or "").strip() or message_text
+                    if reason_text and (reason or not progress_state.get("failure")):
+                        progress_state["failure"] = reason_text
                 try:
                     progress_value = max(0.0, min(0.99, float(progress)))
                 except Exception:
                     progress_value = float(progress_state.get("last_progress") or 0.0)
                 now = _utcnow()
-                last_at = progress_state.get("last_at")
-                seconds_since_last = (
-                    (now - last_at).total_seconds()
-                    if isinstance(last_at, datetime)
-                    else 999.0
-                )
+
+                def _since(key: str) -> float:
+                    value = progress_state.get(key)
+                    return (now - value).total_seconds() if isinstance(value, datetime) else 999.0
+
+                seconds_since_last = _since("last_at")
                 stage_changed = stage_key != str(progress_state.get("last_sub_stage") or "")
-                progress_moved = progress_value >= float(progress_state.get("last_progress") or 0.0) + 0.015
+                progress_moved = progress_value >= float(progress_state.get("last_logged_progress") or 0.0) + 0.015
                 message_changed = message_text != str(progress_state.get("last_message") or "")
-                important = stage_changed or progress_moved or progress_value >= 0.98 or message_changed
+                reached_final = progress_value >= 0.98 and not progress_state.get("final_logged")
+                important = stage_changed or progress_moved or reached_final or message_changed
                 if not important and seconds_since_last < 2.0:
                     return
+                # Unchanged heartbeats refresh job.progress but only leave a
+                # log row every HEARTBEAT_LOG_INTERVAL_S.
+                persist_log = important or _since("last_log_at") >= HEARTBEAT_LOG_INTERVAL_S
 
                 with session_scope() as progress_session:
                     progress_job = progress_session.get(ProcessingJob, job_id)
@@ -866,32 +968,37 @@ class JobRunner:
                     progress_job.stage = "processing_video"
                     progress_job.updated_at = now
                     progress_session.add(progress_job)
-                    append_job_log(
-                        session=progress_session,
-                        job_id=progress_job.id,
-                        tenant_id=progress_job.tenant_id,
-                        level="info",
-                        stage="processing_video",
-                        message=message_text,
-                        detail_level="detailed",
-                        data={
-                            "sub_stage": stage_key,
-                            "progress": round(progress_job.progress, 4),
-                            **dict(data or {}),
-                        },
-                        # Engine progress IS the workflow view: always
-                        # persist it (the emitter above already rate-limits
-                        # to stage changes / +1.5% progress / new messages).
-                        force_persist=True,
+                    if persist_log:
+                        append_job_log(
+                            session=progress_session,
+                            job_id=progress_job.id,
+                            tenant_id=progress_job.tenant_id,
+                            level="error" if stage_key == "failed" else "info",
+                            stage="processing_video",
+                            message=message_text,
+                            detail_level="detailed",
+                            data={
+                                "sub_stage": stage_key,
+                                "progress": round(progress_job.progress, 4),
+                                **dict(data or {}),
+                            },
+                            # Engine progress IS the workflow view: always
+                            # persist it (rate-limited above to stage changes,
+                            # +1.5% progress, new messages and a 30 s heartbeat).
+                            force_persist=True,
+                        )
+                progress_state.update({"last_at": now, "last_progress": progress_value})
+                if persist_log:
+                    progress_state.update(
+                        {
+                            "last_log_at": now,
+                            "last_logged_progress": progress_value,
+                            "last_sub_stage": stage_key,
+                            "last_message": message_text,
+                        }
                     )
-                progress_state.update(
-                    {
-                        "last_at": now,
-                        "last_progress": progress_value,
-                        "last_sub_stage": stage_key,
-                        "last_message": message_text,
-                    }
-                )
+                    if progress_value >= 0.98:
+                        progress_state["final_logged"] = True
 
             def _cfg_int(key: str) -> Optional[int]:
                 value = config.get(key)
@@ -1169,7 +1276,11 @@ class JobRunner:
                     job.stage = "failed"
                     job.progress = 1.0
                     job.result_json = result_payload
-                    job.error_message = "Processing pipeline reported failure"
+                    reason = progress_state.get("failure") or _failure_reason_from_progress(output_dir)
+                    job.error_message = (
+                        f"Processing pipeline reported failure: {reason}" if reason
+                        else "Processing pipeline reported failure"
+                    )
                     append_job_log(
                         session=session,
                         job_id=job.id,
@@ -1178,6 +1289,7 @@ class JobRunner:
                         stage="failed",
                         message="Processing pipeline returned failure",
                         detail_level="basic",
+                        data={"reason": reason},
                     )
 
                 job.updated_at = _utcnow()

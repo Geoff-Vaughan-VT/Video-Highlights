@@ -177,10 +177,13 @@ def build_command(
     codec: str = "libx264",
     codec_args: Optional[Sequence[str]] = None,
     copy: bool = False,
+    scale_height: Optional[int] = None,
 ) -> List[str]:
     """ffmpeg command that decodes ONLY ``[start_s, end_s]``.
 
     ``-ss`` precedes ``-i`` (input seeking) and ``-t`` bounds the duration.
+    ``scale_height``: re-encode scaled to this height (width keeps the
+    aspect, even); ignored with ``copy``.
     """
     start_s = max(0.0, float(start_s))
     duration = float(end_s) - start_s
@@ -196,6 +199,9 @@ def build_command(
     if copy:
         cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
     else:
+        if scale_height:
+            height = max(2, int(scale_height) - int(scale_height) % 2)
+            cmd += ["-vf", f"scale=-2:{height}:flags=bicubic"]
         cmd += ["-c:v", codec, *(codec_args if codec_args is not None else ENCODER_ARGS.get(codec, [])),
                 "-pix_fmt", "yuv420p"]
         if include_audio:
@@ -225,8 +231,10 @@ def render_clip_ffmpeg(
     end_seconds: float,
     include_audio: bool = True,
     prefer_gpu: bool = True,
+    scale_height: Optional[int] = None,
 ) -> str:
-    """Re-encode ``[start_seconds, end_seconds]`` of ``video_path`` (input seek)."""
+    """Re-encode ``[start_seconds, end_seconds]`` of ``video_path`` (input seek),
+    optionally scaled to ``scale_height`` (e.g. the run's ``output_height``)."""
     start_s = max(0.0, float(start_seconds))
     end_s = float(end_seconds)
     if end_s <= start_s:
@@ -235,7 +243,7 @@ def render_clip_ffmpeg(
     ensure_dir(str(out_file.parent))
     attempts = [
         (codec, build_command(video_path, str(out_file), start_s, end_s, include_audio=include_audio,
-                              codec=codec, codec_args=args))
+                              codec=codec, codec_args=args, scale_height=scale_height))
         for codec, args in _codec_attempts(prefer_gpu)
     ]
     try:

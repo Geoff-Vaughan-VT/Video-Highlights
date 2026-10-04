@@ -14,6 +14,8 @@ from backend.schemas import JobConfig, validate_job_config
 def _no_model_family(monkeypatch):
     monkeypatch.delenv("VH_MODEL_FAMILY", raising=False)
     monkeypatch.delenv("VH_MEDIA_ROOTS", raising=False)
+    # Production default: API configs cannot choose output_dir.
+    monkeypatch.setenv("VH_ALLOW_OUTPUT_DIR_OVERRIDE", "0")
 
 
 def _match(client: TestClient, tmp_path: Path) -> str:
@@ -87,27 +89,54 @@ def test_create_job_rejects_invalid_config_with_400(client: TestClient, tmp_path
 
 def test_create_job_stores_resolved_config(client: TestClient, tmp_path: Path) -> None:
     match_id = _match(client, tmp_path)
-    resp = _create(client, match_id, {"profile": "fast", "camera_mode": "follow_ball", "debug_video": True,
-                                      "output_dir": str(tmp_path / "out")})
+    resp = _create(client, match_id, {"profile": "fast", "camera_mode": "follow_ball", "debug_video": True})
     assert resp.status_code == 201, resp.text
     config = resp.json()["config"]
     assert config["proxy_height"] == 720 and config["yolo_model"] == "yolov8n.pt"
     assert config["debug_video"] is True and config["profile_overrides"] == ["debug_video"]
-    assert config["output_dir"] == str((tmp_path / "out").resolve())
+    assert "output_dir" not in config
+
+
+def test_output_dir_is_rejected_unless_test_override(client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    match_id = _match(client, tmp_path)
+    for value in (str(tmp_path / "out"), "/etc/vh_out", "./outputs/job_other"):
+        resp = _create(client, match_id, {"output_dir": value})
+        assert resp.status_code == 400, resp.text
+        assert "output_dir" in resp.json()["error"]["message"]
+    with pytest.raises(ValueError):
+        validate_job_config({"output_dir": str(tmp_path / "out")})
+    # null means unset and stays accepted (the Studio UI sends output_dir: null).
+    assert "output_dir" not in validate_job_config({"output_dir": None})
+
+    monkeypatch.setenv("VH_ALLOW_OUTPUT_DIR_OVERRIDE", "1")
+    ok = _create(client, match_id, {"output_dir": str(tmp_path / "out")})
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["config"]["output_dir"] == str((tmp_path / "out").resolve())
 
 
 def test_media_roots_restrict_paths(client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    from backend.config import settings
+
     allowed = tmp_path / "media"
     allowed.mkdir()
     (allowed / "game.mp4").write_bytes(b"x")
-    monkeypatch.setenv("VH_MEDIA_ROOTS", str(allowed))
     match_id = _match(client, tmp_path)
-    outside = _create(client, match_id, {"output_dir": "/etc/vh_out"})
-    assert outside.status_code == 400
+    # Without VH_MEDIA_ROOTS any path is accepted except the output root.
+    monkeypatch.setattr(settings, "output_root", str(tmp_path / "outputs"))
+    (tmp_path / "outputs" / "job_x").mkdir(parents=True)
+    (tmp_path / "outputs" / "job_x" / "full_follow_ball_zoom.mp4").write_bytes(b"x")
+    in_outputs = _create(client, match_id, {"video_path": str(tmp_path / "outputs" / "job_x" / "full_follow_ball_zoom.mp4")})
+    assert in_outputs.status_code == 400, in_outputs.text
+    assert _create(client, match_id, {"video_path": str(tmp_path / "elsewhere.mp4")}).status_code == 201
+
+    monkeypatch.setenv("VH_MEDIA_ROOTS", str(allowed))
     bad_video = _create(client, match_id, {"video_path": str(tmp_path / "elsewhere.mp4")})
     assert bad_video.status_code == 400
-    ok = _create(client, match_id, {"video_path": str(allowed / "game.mp4"), "output_dir": str(allowed / "run1")})
+    ok = _create(client, match_id, {"video_path": str(allowed / "game.mp4")})
     assert ok.status_code == 201, ok.text
+    assert ok.json()["config"]["video_path"] == str((allowed / "game.mp4").resolve())
+    # Even with the test override, output_dir must stay inside the allowed roots.
+    monkeypatch.setenv("VH_ALLOW_OUTPUT_DIR_OVERRIDE", "1")
     with pytest.raises(ValueError):
         validate_job_config({"output_dir": str(tmp_path.parent / "nope")})
 
@@ -131,8 +160,7 @@ def test_rerun_validates_and_applies_new_profile(client: TestClient, tmp_path: P
 
 def test_track_this_player_rerun_never_writes_into_source_run(client: TestClient, tmp_path: Path) -> None:
     match_id = _match(client, tmp_path)
-    source_dir = tmp_path / "source_run"
-    parent = _create(client, match_id, {"profile": "fast", "output_dir": str(source_dir)})
+    parent = _create(client, match_id, {"profile": "fast"})
     parent_id = parent.json()["job_id"]
     rerun = client.post(f"/v1/jobs/{parent_id}/rerun", json={"config_overrides": {
         "camera_mode": "follow_player", "focus_track_id": 7, "reuse_tracking_from_job": parent_id,
@@ -145,6 +173,17 @@ def test_track_this_player_rerun_never_writes_into_source_run(client: TestClient
 
     missing = client.post(f"/v1/jobs/{parent_id}/rerun", json={"config_overrides": {"reuse_tracking_from_job": "job_nope"}})
     assert missing.status_code == 400
+    for bad in ("./other", "../job_x", "/abs/run", "job.x", "a" * 65):
+        resp = client.post(f"/v1/jobs/{parent_id}/rerun", json={"config_overrides": {"reuse_tracking_from_job": bad}})
+        assert resp.status_code == 400, (bad, resp.text)
+        assert _create(client, match_id, {"reuse_tracking_from_job": bad}).status_code == 400, bad
+    assert _create(client, match_id, {"reuse_tracking_from_job": "job_nope"}).status_code == 400
+    ok = _create(client, match_id, {"reuse_tracking_from_job": parent_id, "camera_mode": "follow_player"})
+    assert ok.status_code == 201, ok.text
+
+    # Tracks are per source video: another match's job cannot be reused.
+    other_match = _match(client, tmp_path)
+    assert _create(client, other_match, {"reuse_tracking_from_job": parent_id}).status_code == 400
 
 
 def test_event_types_include_cards() -> None:

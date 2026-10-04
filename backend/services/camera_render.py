@@ -61,7 +61,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -113,6 +113,33 @@ _FONT_CANDIDATES: Tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 
+class RenderCancelled(RuntimeError):
+    """The render's ``cancel_event`` was set; ffmpeg was stopped."""
+
+
+class _RenderStopped(RuntimeError):
+    """Internal: another chunk failed, so this one did not (re)start."""
+
+
+def _scoring_side(goal: Dict[str, object]) -> str:
+    """Renderer side convention for one goal: the goal the ball went INTO.
+
+    ``team`` (0 = left label, 1 = right label) wins over ``side`` when known:
+    teams swap ends at half time, so the goal side alone cannot say who
+    scored. Team 0's goals count as "into the right goal", team 1's as "into
+    the left goal"; ``side`` is the fallback when the team is unknown.
+    """
+    team = goal.get("team")
+    if team is not None and not isinstance(team, bool):
+        try:
+            idx = int(team)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            idx = -1
+        if idx in (0, 1):
+            return "right" if idx == 0 else "left"
+    return str(goal.get("side") or "")
+
+
 def _safe_team(name: Optional[str], default: str) -> str:
     cleaned = "".join(ch for ch in str(name or default).upper() if ch.isalnum() or ch in " -")
     return (cleaned.strip() or default)[:10]
@@ -129,7 +156,7 @@ class ScorebugRenderer:
     def __init__(self, goal_events: Sequence[Dict[str, object]], team_left: str = "HOME",
                  team_right: str = "AWAY", flash_s: float = 4.0) -> None:
         self.goals: List[Tuple[float, str]] = sorted(
-            (float(g.get("t", 0.0)), str(g.get("side") or "")) for g in goal_events
+            (float(g.get("t", 0.0)), _scoring_side(g)) for g in goal_events
         )
         self.team_left = _safe_team(team_left, "HOME")
         self.team_right = _safe_team(team_right, "AWAY")
@@ -226,9 +253,11 @@ def make_scorebug_renderer(
 ) -> ScorebugFn:
     """Broadcast scorebug: running score + match clock + GOAL flash.
 
-    ``goal_events``: dicts with ``t`` and ``side`` (which goal the ball
-    entered) in the same timebase as render decisions. A goal INTO the left
-    goal scores for the right-defending team and vice versa. The returned
+    ``goal_events``: dicts with ``t``, ``side`` (which goal the ball
+    entered) and optionally ``team`` (scoring team: 0 = ``team_left``,
+    1 = ``team_right``) in the same timebase as render decisions. ``team``
+    is authoritative (ends swap at half time); without it a goal INTO the
+    left goal scores for the right label and vice versa. The returned
     :class:`ScorebugRenderer` is drawn with ffmpeg ``drawtext`` by the
     ffmpeg engine and with OpenCV by the python engine.
     """
@@ -462,19 +491,37 @@ class VideoInfo:
     has_audio: bool
 
 
+def _stream_rotation(stream: Dict[str, object]) -> int:
+    """Clockwise display rotation (0..359) from the ``rotate`` tag or display matrix."""
+    tags = stream.get("tags") or {}
+    if isinstance(tags, dict) and "rotate" in tags:
+        try:
+            return int(float(tags["rotate"])) % 360  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pass
+    for side in stream.get("side_data_list") or []:  # type: ignore[union-attr]
+        if isinstance(side, dict) and "rotation" in side:
+            try:
+                return int(-float(side["rotation"])) % 360
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
 @lru_cache(maxsize=64)
 def _probe_cached(path: str, mtime: float, size: int) -> Optional[VideoInfo]:
+    """Probe in DISPLAY orientation: ffmpeg autorotates on decode, so crop
+    rects (and the planner's frame size) live in the rotated pixel space."""
     del mtime, size
     code, out = _run_quiet([
-        ffprobe_exe(), "-v", "error", "-show_entries",
-        "stream=codec_type,width,height,avg_frame_rate,r_frame_rate:format=duration",
-        "-of", "json", path,
+        ffprobe_exe(), "-v", "error", "-show_streams", "-show_format", "-of", "json", path,
     ])
     if code == 0:
         try:
             data = json.loads(out[out.index("{"):])
             streams = data.get("streams", [])
-            video = next((s for s in streams if s.get("codec_type") == "video"), None)
+            video = next((s for s in streams if s.get("codec_type") == "video"
+                          and not (s.get("disposition") or {}).get("attached_pic")), None)
             if video is not None:
                 fps = 0.0
                 for key in ("avg_frame_rate", "r_frame_rate"):
@@ -485,12 +532,15 @@ def _probe_cached(path: str, mtime: float, size: int) -> Optional[VideoInfo]:
                         fps = 0.0
                     if fps > 0:
                         break
+                width, height = int(video.get("width", 0) or 0), int(video.get("height", 0) or 0)
+                if _stream_rotation(video) % 180 == 90:
+                    width, height = height, width
                 return VideoInfo(
-                    width=int(video.get("width", 0)), height=int(video.get("height", 0)), fps=fps,
+                    width=width, height=height, fps=fps,
                     duration=float(data.get("format", {}).get("duration", 0.0) or 0.0),
                     has_audio=any(s.get("codec_type") == "audio" for s in streams),
                 )
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError):
             pass
     try:
         cv2 = _import_cv2()
@@ -562,16 +612,33 @@ class _Progress:
     """Thread-safe aggregation of per-chunk ffmpeg ``-progress`` output."""
 
     def __init__(self, total: int, callback: Optional[RenderProgressCallback],
-                 info_callback: Optional[ProgressInfoCallback]) -> None:
+                 info_callback: Optional[ProgressInfoCallback],
+                 cancel_event: Optional[threading.Event] = None) -> None:
         self.total = max(1, int(total))
         self.callback = callback
         self.info_callback = info_callback
+        self.cancel_event = cancel_event
+        #: Set on cancel or on the first chunk failure: nothing new may start.
+        self.stop = threading.Event()
         self.done: Dict[str, int] = {}
         self.lock = threading.Lock()
         self.started = time.monotonic()
         self.last_emit = 0.0
 
+    def cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def check(self) -> None:
+        """Raise when the render must stop (checked before every ffmpeg spawn
+        and on every progress line, which kills the running ffmpeg)."""
+        if self.cancelled():
+            self.stop.set()
+            raise RenderCancelled("Render canceled")
+        if self.stop.is_set():
+            raise _RenderStopped("render stopped after another chunk failed")
+
     def update(self, key: str, frames: int, final: bool = False) -> None:
+        self.check()
         with self.lock:
             self.done[key] = max(self.done.get(key, 0), int(frames))
             written = min(self.total, sum(self.done.values()))
@@ -846,7 +913,9 @@ def _render_ffmpeg(
 
         def _render_chunk(chunk: _Chunk, combos) -> Tuple[str, str, Optional[str]]:
             last_err = ""
+            progress.check()
             for mode, enc, hw in combos:
+                progress.check()  # never spawn ffmpeg after a cancel / failure
                 cmd, target = _chunk_cmd(chunk, mode, enc, hw)
                 key = f"c{chunk.index}"
                 code, err = _run_ffmpeg(cmd, work, lambda f, k=key: progress.update(k, f),
@@ -860,6 +929,41 @@ def _render_ffmpeg(
                 target.unlink(missing_ok=True)
             raise RuntimeError(f"ffmpeg camera render failed for {video_path}: {last_err}")
 
+        def _render_parallel(rest: List[_Chunk], combos, n_workers: int) -> None:
+            """Chunks on a pool. The first failure (or a cancel) sets the stop
+            flag in the failing worker: queued chunks are dropped
+            (``cancel_futures``) or refuse to start, and running ffmpegs are
+            killed at their next progress line."""
+
+            def _guarded(chunk: _Chunk):
+                try:
+                    return _render_chunk(chunk, combos)
+                except BaseException:
+                    progress.stop.set()
+                    raise
+
+            pool = ThreadPoolExecutor(max_workers=n_workers)
+            errors: List[BaseException] = []
+            try:
+                futures = [pool.submit(_guarded, c) for c in rest]
+                for future in futures:
+                    # Not as_completed: futures cancelled by shutdown() never
+                    # notify its waiters; result() does see the cancel.
+                    try:
+                        future.result()
+                    except CancelledError:
+                        continue
+                    except BaseException as exc:  # noqa: BLE001
+                        errors.append(exc)
+                        pool.shutdown(wait=False, cancel_futures=True)
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+            if progress.cancelled():
+                raise RenderCancelled("Render canceled")
+            real = [e for e in errors if not isinstance(e, (_RenderStopped, RenderCancelled))]
+            if real or errors:
+                raise (real or errors)[0]
+
         # The first chunk picks the working mode/encoder/hwaccel combination.
         chosen = _render_chunk(chunks[0], attempts)
         rest = chunks[1:]
@@ -870,10 +974,9 @@ def _render_ffmpeg(
                 for chunk in rest:
                     _render_chunk(chunk, combos)
             else:
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    for future in [pool.submit(_render_chunk, c, combos) for c in rest]:
-                        future.result()
+                _render_parallel(rest, combos, n_workers)
 
+        progress.check()
         final_tmp = out_dir / f".{output_path.stem}.partial{output_path.suffix or '.mp4'}"
         if single:
             os.replace(work / "single.mp4", final_tmp)
@@ -1133,6 +1236,7 @@ def render_camera_plan_video(
     progress_info_callback: Optional[ProgressInfoCallback] = None,
     filter_mode: str = "crop",
     stall_timeout_s: Optional[float] = 120.0,
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     """Render ``plan`` to ``output_path`` and return its absolute path.
 
@@ -1151,14 +1255,18 @@ def render_camera_plan_video(
     ``{frame, total, fps, eta_s, elapsed_s}``. ``filter_mode``: ``crop``
     (default) or ``scale`` (see module docstring; the other mode is the
     automatic fallback). ``stall_timeout_s``: kill ffmpeg after this long
-    without progress and try the next combination.
+    without progress and try the next combination. ``cancel_event``: when
+    set, the running ffmpeg is killed, no further chunk starts and
+    :class:`RenderCancelled` is raised.
     """
     if not plan.decisions:
         raise RuntimeError("camera plan is empty")
     out_file = Path(output_path)
     ensure_dir(str(out_file.parent))
     started = time.monotonic()
-    progress = _Progress(len(plan.decisions), progress_callback, progress_info_callback)
+    progress = _Progress(len(plan.decisions), progress_callback, progress_info_callback,
+                         cancel_event=cancel_event)
+    progress.check()
 
     if debug_wide:
         if debug_source_path:

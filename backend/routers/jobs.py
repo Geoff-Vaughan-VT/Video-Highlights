@@ -11,7 +11,14 @@ from ..auth import UserContext, require_roles
 from ..config import settings
 from ..database import get_session
 from ..models import Event, JobLogEntry, Match, NotificationLog, ProcessingJob
-from ..schemas import JobCreate, JobRead, JobRerunRequest, validate_job_config
+from ..schemas import (
+    JobCreate,
+    JobRead,
+    JobRerunRequest,
+    is_valid_job_id,
+    output_dir_override_allowed,
+    validate_job_config,
+)
 from ..serializers import job_log_to_read, job_to_read, notification_to_read
 from ..services.job_logging import append_job_log
 from ..services.job_runner import job_runner
@@ -44,9 +51,29 @@ def _validated_config(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _job_output_dir(job: ProcessingJob) -> str:
+    """Where ``job`` writes: ``<output_root>/<job_id>`` (``config.output_dir``
+    only with the test override; legacy rows' stored value is ignored)."""
     config = dict(job.config_json or {})
-    result = dict(job.result_json or {})
-    return str(config.get("output_dir") or result.get("output_dir") or os.path.join(settings.output_root, job.id))
+    if output_dir_override_allowed() and config.get("output_dir"):
+        return str(config["output_dir"])
+    return os.path.join(settings.output_root, job.id)
+
+
+def _check_reuse_source(session: Session, tenant_id: str, match_id: str, config: Dict[str, Any]) -> None:
+    """``reuse_tracking_from_job`` must name an existing job of this tenant and match."""
+    reuse_id = config.get("reuse_tracking_from_job")
+    if not reuse_id:
+        return
+    if not is_valid_job_id(reuse_id):
+        raise HTTPException(status_code=400, detail="Invalid job config: reuse_tracking_from_job must be a job id")
+    source_job = session.get(ProcessingJob, str(reuse_id))
+    if source_job is None or source_job.tenant_id != tenant_id:
+        raise HTTPException(status_code=400, detail=f"reuse_tracking_from_job not found: {reuse_id}")
+    if source_job.match_id != match_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reuse_tracking_from_job {reuse_id} belongs to another match; tracks are per source video",
+        )
 
 
 def _rerun_base_config(parent: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
@@ -170,8 +197,7 @@ def _refresh_match_latest_processing_metadata(session: Session, match: Match) ->
 
 
 def _read_live_manifest_bookmarks(job: ProcessingJob) -> list[Dict[str, object]]:
-    config = dict(job.config_json or {})
-    output_dir = str(config.get("output_dir") or os.path.join(settings.output_root, job.id))
+    output_dir = _job_output_dir(job)
     manifest_path = os.path.join(output_dir, "analysis_bookmarks.json")
     if not os.path.exists(manifest_path):
         return []
@@ -298,15 +324,7 @@ def create_job(
         raise HTTPException(status_code=404, detail=f"Match not found: {match_id}")
 
     config = _validated_config(payload.config)
-    reuse_id = config.get("reuse_tracking_from_job")
-    if reuse_id:
-        source_job = session.get(ProcessingJob, str(reuse_id))
-        if source_job is not None and source_job.tenant_id != tenant.tenant_id:
-            raise HTTPException(status_code=400, detail=f"reuse_tracking_from_job not found: {reuse_id}")
-        if source_job is not None and config.get("output_dir") and os.path.abspath(
-            str(config["output_dir"])
-        ) == os.path.abspath(_job_output_dir(source_job)):
-            config.pop("output_dir", None)
+    _check_reuse_source(session, tenant.tenant_id, match_id, config)
     job = ProcessingJob(tenant_id=match.tenant_id, match_id=match_id, config_json=config)
     session.add(job)
     session.commit()
@@ -537,8 +555,11 @@ def delete_job(
     tenant: TenantContext = Depends(get_tenant_context),
 ) -> Dict[str, object]:
     job = _get_tenant_job_or_404(session, tenant.tenant_id, job_id)
-    if job.status in {"running", "claimed"}:
-        raise HTTPException(status_code=409, detail="Cannot delete active job. Cancel/kill it first.")
+    if job.status in {"running", "claimed", "cancel_requested"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete an active job. Cancel/kill it first and wait until it stops.",
+        )
 
     match = session.get(Match, job.match_id)
     logs = list(
@@ -641,18 +662,14 @@ def rerun_job(
         raise HTTPException(status_code=404, detail=f"Match not found for job: {job_id}")
 
     overrides = dict(payload.config_overrides or {})
-    new_config = _rerun_base_config(dict(job.config_json or {}), overrides)
-    reuse_id = new_config.get("reuse_tracking_from_job")
-    if reuse_id:
-        source_job = session.get(ProcessingJob, str(reuse_id))
-        if source_job is None or source_job.tenant_id != tenant.tenant_id:
-            raise HTTPException(status_code=400, detail=f"reuse_tracking_from_job not found: {reuse_id}")
-        # Never write a re-render into the source run's folder.
-        if new_config.get("output_dir") and os.path.abspath(str(new_config["output_dir"])) == os.path.abspath(
-            _job_output_dir(source_job)
-        ):
-            new_config.pop("output_dir", None)
+    parent_config = dict(job.config_json or {})
+    if "output_dir" not in overrides:
+        # A rerun is a new run folder (<output_root>/<new job id>); never
+        # inherit the parent's folder (legacy rows may still carry one).
+        parent_config.pop("output_dir", None)
+    new_config = _rerun_base_config(parent_config, overrides)
     new_config = _validated_config(new_config)
+    _check_reuse_source(session, tenant.tenant_id, job.match_id, new_config)
     rerun = ProcessingJob(tenant_id=job.tenant_id, match_id=job.match_id, config_json=new_config)
     session.add(rerun)
     session.commit()

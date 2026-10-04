@@ -20,6 +20,8 @@ from ..schemas import (
     MatchRead,
     MatchStatsRead,
     UploadPolicyRead,
+    check_media_path,
+    is_url_like,
 )
 from ..serializers import match_to_read
 from ..services.ffmpeg_tools import ffprobe_exe
@@ -100,12 +102,42 @@ def _run_ffprobe(path: str) -> Dict[str, Any]:
     }
 
 
+def _checked_source_path(value: str | None) -> str | None:
+    """Enforce the media-root policy (``VH_MEDIA_ROOTS`` + upload storage,
+    never the output root) on a match's local ``source_video_path``.
+
+    Links (``scheme://``) and empty values pass through unchanged; 400 otherwise.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or is_url_like(text):
+        return value
+    try:
+        check_media_path(text, field="source_video_path")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return value
+
+
+def _check_metadata_asset_paths(metadata: Dict[str, Any] | None) -> None:
+    """Client-supplied ``metadata.assets[].path`` values are served and read
+    as sources later, so they get the same media-root policy."""
+    for asset in list((metadata or {}).get("assets", []) or []):
+        if isinstance(asset, dict) and asset.get("path"):
+            _checked_source_path(str(asset["path"]))
+
+
 def _inspect_local_video_path(path: str) -> Dict[str, Any]:
     raw_path = str(path or "").strip().strip('"')
     if not raw_path:
         return {"ok": False, "code": "path_required", "path": "", "message": "Choose a local video file path."}
 
     clean_path = os.path.abspath(raw_path)
+    try:
+        check_media_path(clean_path, field="path")
+    except ValueError as exc:
+        return {"ok": False, "code": "outside_media_roots", "path": clean_path, "message": str(exc)}
     extension = os.path.splitext(clean_path)[1].lower()
     payload: Dict[str, Any] = {
         "ok": False,
@@ -196,6 +228,8 @@ def create_match(
 
     # Classify the ingest source so stat coverage can be disclosed up front
     # and the stat catalog can mark link-limited statistics unavailable.
+    _checked_source_path(payload.source_video_path)
+    _check_metadata_asset_paths(payload.metadata)
     metadata = dict(payload.metadata or {})
     if not metadata.get("source_type"):
         detected = detect_source_from_url(payload.source_video_path)
@@ -341,6 +375,15 @@ def update_match(
         raise HTTPException(status_code=404, detail=f"Match not found: {match_id}")
 
     data = payload.model_dump(exclude_unset=True)
+    if data.get("source_video_path") is not None:
+        _checked_source_path(data["source_video_path"])
+    if isinstance(data.get("metadata"), dict):
+        existing = {str(a.get("path")) for a in list((match.metadata_json or {}).get("assets", []) or [])
+                    if isinstance(a, dict)}
+        # Assets the server registered earlier (uploads, register-local) are
+        # kept as they are; only newly supplied paths are checked.
+        _check_metadata_asset_paths({"assets": [a for a in list(data["metadata"].get("assets", []) or [])
+                                                if isinstance(a, dict) and str(a.get("path")) not in existing]})
     if "tenant_id" in data:
         requested = data["tenant_id"]
         if requested and requested != match.tenant_id:

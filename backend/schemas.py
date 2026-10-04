@@ -103,6 +103,26 @@ _HEX_COLOR = re.compile(r"^#?[0-9a-fA-F]{6}$")
 _DEVICE = re.compile(r"^(auto|cpu|mps|cuda(:\d+)?)$")
 
 
+_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_URL_LIKE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def output_dir_override_allowed() -> bool:
+    """``VH_ALLOW_OUTPUT_DIR_OVERRIDE=1`` lets a job config choose ``output_dir``.
+
+    Off by default: API jobs always write to ``<output_root>/<job_id>``. The
+    override exists for test suites that seed run folders; it is read on
+    every call so tests can toggle it.
+    """
+    return os.getenv("VH_ALLOW_OUTPUT_DIR_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_valid_job_id(value: object) -> bool:
+    """Job ids are ``job_<hex>``; accept ``[A-Za-z0-9_-]{1,64}`` (no dots, no separators)."""
+    return isinstance(value, str) and bool(_JOB_ID.match(value))
+
+
 def media_roots() -> List[Path]:
     """Allowed media roots from ``VH_MEDIA_ROOTS`` (comma/os.pathsep separated)."""
     raw = os.getenv("VH_MEDIA_ROOTS", "").strip()
@@ -118,6 +138,105 @@ def _is_within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def check_media_path(value: str, *, field: str = "video_path") -> Path:
+    """Resolve a source-video path and enforce the media-root policy.
+
+    * Never inside ``output_root`` (run folders hold other jobs' proxies and
+      movies; reading them as a "source" would leak them across tenants).
+    * With ``VH_MEDIA_ROOTS`` set: must be inside one of those roots or the
+      local upload storage root.
+    * Without it: any other path is accepted (local single-user installs).
+
+    Raises ``ValueError`` with a user-facing message.
+    """
+    from .config import settings
+
+    text = str(value or "")
+    if not text.strip() or "\x00" in text:
+        raise ValueError(f"{field} is empty or invalid")
+    resolved = Path(text.strip()).expanduser().resolve()
+    storage_root = Path(settings.local_storage_root).expanduser().resolve()
+    output_root = Path(settings.output_root).expanduser().resolve()
+    if _is_within(resolved, storage_root):
+        return resolved
+    if _is_within(resolved, output_root):
+        raise ValueError(f"{field} must not point inside the output root ({output_root})")
+    roots = media_roots()
+    if roots and not any(_is_within(resolved, root) for root in roots):
+        raise ValueError(f"{field} must be under a VH_MEDIA_ROOTS directory or the upload storage root")
+    return resolved
+
+
+def is_url_like(value: object) -> bool:
+    """True for ``scheme://...`` sources (links), which are not filesystem paths."""
+    return isinstance(value, str) and bool(_URL_LIKE.match(value.strip()))
+
+
+def _check_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        try:
+            value = float(str(value))
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be a number") from None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be finite")
+    return number
+
+
+def _validate_player_roi(value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """``{x1_norm, y1_norm, x2_norm, y2_norm}`` (0..1) or ``{x, y, w, h}``
+    (pixels, or 0..1 with ``normalized: true``), plus optional ``t`` /
+    ``time_s`` / ``window_s`` seconds."""
+    if not value:
+        return None
+    roi = dict(value)
+    norm_keys = ("x1_norm", "y1_norm", "x2_norm", "y2_norm")
+    box_keys = ("x", "y", "w", "h")
+    if all(k in roi for k in norm_keys):
+        x1, y1, x2, y2 = (_check_number(roi[k], f"player_roi.{k}") for k in norm_keys)
+        if not all(0.0 <= v <= 1.0 for v in (x1, y1, x2, y2)):
+            raise ValueError("player_roi *_norm values must be between 0 and 1")
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("player_roi needs x2_norm > x1_norm and y2_norm > y1_norm")
+        roi.update({"x1_norm": x1, "y1_norm": y1, "x2_norm": x2, "y2_norm": y2})
+    elif all(k in roi for k in box_keys):
+        x, y, w, h = (_check_number(roi[k], f"player_roi.{k}") for k in box_keys)
+        if x < 0 or y < 0 or w <= 0 or h <= 0:
+            raise ValueError("player_roi needs x, y >= 0 and w, h > 0")
+        if roi.get("normalized") and (x + w > 1.0 + 1e-6 or y + h > 1.0 + 1e-6):
+            raise ValueError("normalized player_roi must fit inside 0..1")
+        roi.update({"x": x, "y": y, "w": w, "h": h})
+    else:
+        raise ValueError("player_roi must have x1_norm/y1_norm/x2_norm/y2_norm or x/y/w/h")
+    for key in ("t", "time_s", "window_s"):
+        if roi.get(key) is not None:
+            number = _check_number(roi[key], f"player_roi.{key}")
+            if number < 0:
+                raise ValueError(f"player_roi.{key} must be >= 0")
+            roi[key] = number
+    if "normalized" in roi and not isinstance(roi["normalized"], bool):
+        raise ValueError("player_roi.normalized must be true or false")
+    return roi
+
+
+def _validate_goal_box(value: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    """``{x1, y1, x2, y2}`` in source pixels (or all <= 1.0: normalized)."""
+    if not value:
+        return None
+    box = dict(value)
+    try:
+        x1, y1, x2, y2 = (_check_number(box[k], f"{name}.{k}") for k in ("x1", "y1", "x2", "y2"))
+    except KeyError:
+        raise ValueError(f"{name} must have x1, y1, x2, y2") from None
+    if min(x1, y1, x2, y2) < 0:
+        raise ValueError(f"{name} coordinates must be >= 0")
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"{name} needs x2 > x1 and y2 > y1")
+    box.update({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    return box
 
 
 def _parse_seconds(value: Union[float, int, str, None]) -> Optional[float]:
@@ -174,6 +293,8 @@ class JobConfig(BaseModel):
     device: Optional[str] = None
     focus_track_id: Optional[int] = Field(default=None, ge=0)
     player_roi: Optional[Dict[str, Any]] = None
+    goal_box_left: Optional[Dict[str, Any]] = None
+    goal_box_right: Optional[Dict[str, Any]] = None
     reuse_tracking_from_job: Optional[str] = None
     pitch_corners: Optional[List[List[float]]] = None
     reel_minutes: Optional[float] = Field(default=None, gt=0.0, le=120.0)
@@ -257,16 +378,66 @@ class JobConfig(BaseModel):
             return None
         if len(value) != 4 or any(len(p) != 2 for p in value):
             raise ValueError("pitch_corners must be 4 [x, y] points (TL, TR, BR, BL)")
-        return [[float(p[0]), float(p[1])] for p in value]
+        points = [[_check_number(p[0], "pitch_corners"), _check_number(p[1], "pitch_corners")] for p in value]
+        if any(v < 0 for p in points for v in p):
+            raise ValueError("pitch_corners coordinates must be >= 0")
+        if len({(round(p[0], 3), round(p[1], 3)) for p in points}) != 4:
+            raise ValueError("pitch_corners must be 4 distinct points")
+        return points
 
-    @field_validator("yolo_model", "tracker_config")
+    @field_validator("player_roi")
     @classmethod
-    def _check_name(cls, value: Optional[str]) -> Optional[str]:
+    def _check_roi(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        return _validate_player_roi(value)
+
+    @field_validator("goal_box_left", "goal_box_right")
+    @classmethod
+    def _check_goal_box(cls, value: Optional[Dict[str, Any]], info) -> Optional[Dict[str, Any]]:  # noqa: ANN001
+        if value is None:
+            return None
+        return _validate_goal_box(value, info.field_name)
+
+    @field_validator("reuse_tracking_from_job")
+    @classmethod
+    def _check_reuse(cls, value: Optional[str]) -> Optional[str]:
         if value is None or not str(value).strip():
             return None
         text = str(value).strip()
-        if "\x00" in text or ".." in Path(text).parts:
-            raise ValueError("invalid model/tracker name")
+        if not is_valid_job_id(text):
+            raise ValueError("reuse_tracking_from_job must be a job id (letters, digits, '_' or '-')")
+        return text
+
+    @field_validator("yolo_model")
+    @classmethod
+    def _check_model(cls, value: Optional[str]) -> Optional[str]:
+        """Stock/bare weight names, or a file inside the model directory
+        (``VH_MODEL_DIR``); arbitrary filesystem paths are rejected."""
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if "\x00" in text:
+            raise ValueError("invalid model name")
+        if _MODEL_NAME.match(text) and ".." not in text:
+            return text
+        from .services.perf_profiles import model_dir
+
+        root = model_dir().expanduser().resolve()
+        candidate = Path(text).expanduser()
+        resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+        if not _is_within(resolved, root):
+            raise ValueError("yolo_model must be a stock model name or a file inside VH_MODEL_DIR")
+        return str(resolved)
+
+    @field_validator("tracker_config")
+    @classmethod
+    def _check_tracker(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if not _MODEL_NAME.match(text) or ".." in text:
+            raise ValueError("tracker_config must be a tracker name like bytetrack.yaml or botsort.yaml")
         return text
 
     @field_validator("select_player")
@@ -279,32 +450,42 @@ class JobConfig(BaseModel):
             )
         return value
 
-    @field_validator("video_path", "output_dir")
+    @field_validator("video_path")
     @classmethod
-    def _check_paths(cls, value: Optional[str], info) -> Optional[str]:  # noqa: ANN001
+    def _check_video_path(cls, value: Optional[str]) -> Optional[str]:
         if value is None or not str(value).strip():
             return None
+        resolved = check_media_path(str(value), field="video_path")
+        if media_roots() and not resolved.is_file():
+            raise ValueError(f"video_path does not exist: {resolved}")
+        if not media_roots():
+            from .config import settings
+
+            storage = Path(settings.local_storage_root).expanduser().resolve()
+            if not _is_within(resolved, storage):
+                _JOB_LOGGER.warning(
+                    "video_path %s is outside the storage root; set VH_MEDIA_ROOTS to restrict job paths", resolved,
+                )
+        return str(resolved)
+
+    @field_validator("output_dir")
+    @classmethod
+    def _check_output_dir(cls, value: Optional[str]) -> Optional[str]:
+        """API jobs always write to ``<output_root>/<job_id>``; ``output_dir``
+        is only accepted with ``VH_ALLOW_OUTPUT_DIR_OVERRIDE=1`` (tests)."""
+        if value is None or not str(value).strip():
+            return None
+        if not output_dir_override_allowed():
+            raise ValueError("output_dir is not accepted; runs are always written to <output_root>/<job_id>")
         from .config import settings
 
-        path = Path(str(value)).expanduser()
         if "\x00" in str(value):
             raise ValueError("invalid path")
-        resolved = path.resolve()
-        defaults = [Path(settings.output_root).expanduser().resolve(),
-                    Path(settings.local_storage_root).expanduser().resolve()]
-        roots = media_roots()
-        if roots:
-            if not any(_is_within(resolved, root) for root in roots + defaults):
-                raise ValueError(
-                    f"{info.field_name} must be under the output root or a VH_MEDIA_ROOTS directory"
-                )
-        elif not any(_is_within(resolved, root) for root in defaults):
-            _JOB_LOGGER.warning(
-                "%s %s is outside the output/storage roots; set VH_MEDIA_ROOTS to restrict job paths",
-                info.field_name, resolved,
-            )
-        if info.field_name == "video_path" and roots and not resolved.is_file():
-            raise ValueError(f"video_path does not exist: {resolved}")
+        resolved = Path(str(value)).expanduser().resolve()
+        allowed = [Path(settings.output_root).expanduser().resolve(),
+                   Path(settings.local_storage_root).expanduser().resolve()] + media_roots()
+        if media_roots() and not any(_is_within(resolved, root) for root in allowed):
+            raise ValueError("output_dir must be under the output root or a VH_MEDIA_ROOTS directory")
         return str(resolved)
 
     @model_validator(mode="after")

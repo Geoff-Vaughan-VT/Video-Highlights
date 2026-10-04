@@ -701,11 +701,17 @@ def write_full_follow_cam_video(
 
 
 def draw_single_spotlight_overlay(video_path: str, traj: List[TrackPoint], interval: Tuple[float, float],
-                                   clip_num: int, out_dir: str, radius: int = 35) -> Optional[str]:
-    """Draw spotlight overlay for a single clip (used for parallel processing)"""
+                                   clip_num: int, out_dir: str, radius: int = 35,
+                                   time_offset: float = 0.0, xy_scale: float = 1.0) -> Optional[str]:
+    """Draw spotlight overlay for a single clip (used for parallel processing).
+
+    ``interval`` is in ``video_path``'s timebase; a track point at ``p.t``
+    is drawn at ``p.t + time_offset`` and at ``p.xy * xy_scale`` (e.g. the
+    proxy scale when the track is in source pixels and the video is the proxy).
+    """
     s, e = interval
-    t_arr = np.array([p.t for p in traj])
-    xy_arr = np.array([p.xy for p in traj])
+    t_arr = np.array([p.t for p in traj], dtype=float) + float(time_offset)
+    xy_arr = np.array([p.xy for p in traj], dtype=float) * float(xy_scale)
 
     def pos_at(t: float) -> Tuple[int, int]:
         # nearest neighbor in time
@@ -785,8 +791,10 @@ def draw_single_spotlight_overlay(video_path: str, traj: List[TrackPoint], inter
 
 
 def draw_spotlight_overlay(video_path: str, traj: List[TrackPoint], intervals: List[Tuple[float, float]],
-                           out_dir: str, radius: int = 35, max_workers: Optional[int] = None):
-    """Draw spotlight overlays using parallel processing"""
+                           out_dir: str, radius: int = 35, max_workers: Optional[int] = None,
+                           time_offset: float = 0.0, xy_scale: float = 1.0):
+    """Draw spotlight overlays using parallel processing (see
+    :func:`draw_single_spotlight_overlay` for ``time_offset`` / ``xy_scale``)."""
     if max_workers is None:
         # Use up to 50% of CPU count for overlays (memory intensive)
         max_workers = max(2, int(multiprocessing.cpu_count() * 0.5))
@@ -796,7 +804,8 @@ def draw_spotlight_overlay(video_path: str, traj: List[TrackPoint], intervals: L
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all overlay rendering tasks
         future_to_clip = {
-            executor.submit(draw_single_spotlight_overlay, video_path, traj, interval, k, out_dir, radius): k
+            executor.submit(draw_single_spotlight_overlay, video_path, traj, interval, k, out_dir, radius,
+                            time_offset, xy_scale): k
             for k, interval in enumerate(intervals, start=1)
         }
 
@@ -1099,6 +1108,13 @@ def _find_proxy_file(run_dir: str, tracking: Optional[TrackingResult]) -> Option
 
 
 def _link_or_copy(src: str, dst: str) -> None:
+    """Hard-link ``src`` to ``dst`` (copy across filesystems).
+
+    Reused proxies are GBs for a full match, so they are linked, not copied.
+    A hard link shares the inode: anything that later writes ``dst`` IN PLACE
+    would corrupt the source run, so every writer of these names in a run
+    folder must unlink first (see :func:`_unlink_proxy_targets`).
+    """
     import shutil
 
     if os.path.abspath(src) == os.path.abspath(dst):
@@ -1109,6 +1125,22 @@ def _link_or_copy(src: str, dst: str) -> None:
         os.link(src, dst)
     except OSError:
         shutil.copy2(src, dst)
+
+
+def _unlink_proxy_targets(output_dir: str, proxy_height: int) -> None:
+    """Remove the files ``build_proxy`` is about to (over)write in place.
+
+    They may be hard links into another run (a previous reuse); ffmpeg's
+    ``-y`` truncates the shared inode, so unlinking first keeps the other
+    run's proxy/audio intact.
+    """
+    for name in (f"proxy_{int(proxy_height)}p.mp4", _fs.AUDIO_ANALYSIS_FILENAME):
+        target = os.path.join(output_dir, name)
+        try:
+            if os.path.lexists(target):
+                os.remove(target)
+        except OSError as exc:
+            LOGGER.warning("could not remove %s before the proxy pass: %s", target, exc)
 
 
 def _normalize_corners(corners: object, frame_size: Tuple[int, int]) -> Optional[List[List[float]]]:
@@ -1158,7 +1190,9 @@ def _apply_focus(tracking: TrackingResult, focus_track_id: Optional[int],
         try:
             return selector(tracking, focus_roi=player_roi, focus_track_id=focus_track_id,
                             stride=max(1, int(tracking.vid_stride or 1)))
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
+            print(f"[warn] Focus selection failed ({exc}); player_roi={player_roi!r} "
+                  f"focus_track_id={focus_track_id!r}. Falling back to the track id / previous focus.")
             LOGGER.warning("focus selection failed: %s", exc)
     if focus_track_id is not None and int(focus_track_id) in tracking.players:
         tracking.focus_track_id = int(focus_track_id)
@@ -1323,9 +1357,9 @@ def _preflight_dependencies(camera_mode: str, analysis_only: bool, no_audio: boo
             "Install with: pip install ultralytics"
         )
     try:
-        from backend.services.ffmpeg_tools import ffmpeg_exe
+        from backend.services.ffmpeg_tools import ffmpeg_available
 
-        ffmpeg_ok = bool(ffmpeg_exe())
+        ffmpeg_ok = bool(ffmpeg_available())
     except Exception:
         ffmpeg_ok = _shutil.which("ffmpeg") is not None
     if not ffmpeg_ok:
@@ -1504,6 +1538,12 @@ def _process_video_highlights_impl(
         proxy = None
         if reuse_dir:
             tracking = TrackingResult.load(reuse_dir)
+            reuse_window = (float(tracking.trim_offset_s or 0.0),
+                            float(tracking.trim_offset_s or 0.0) + float(tracking.duration_s or 0.0))
+            if (trim_start is not None and abs(float(trim_start) - reuse_window[0]) > 0.05) or (
+                    trim_end is not None and tracking.duration_s and abs(float(trim_end) - reuse_window[1]) > 0.05):
+                print(f"[warn] Requested trim {trim_start}-{trim_end} differs from the reused tracking window "
+                      f"({reuse_window[0]:.2f}s-{reuse_window[1]:.2f}s); using the reused window")
             reuse_proxy = _find_proxy_file(reuse_dir, tracking)
             if reuse_proxy:
                 proxy = _fs.proxy_result_from_file(reuse_proxy, source_size=tuple(tracking.frame_size),
@@ -1526,12 +1566,19 @@ def _process_video_highlights_impl(
                 proxy.audio_path = audio_local if os.path.isfile(audio_local) else None
                 proxy.thumbs_dir = os.path.join(output_dir, _fs.THUMBS_DIRNAME)
                 tracker.update(1.0, "Reusing proxy from previous run")
-                if trim_start is not None and abs(float(trim_start) - float(tracking.trim_offset_s)) > 0.05:
-                    print(f"[warn] trim_start {trim_start} differs from the reused tracking window "
-                          f"({tracking.trim_offset_s:.2f}s); using the reused window")
         if proxy is None:
+            proxy_start, proxy_end = trim_start, trim_end
+            if tracking is not None:
+                # Reused tracks without their proxy: rebuild the proxy over the
+                # TRACKED window (track times are relative to it), never the
+                # new request's trim, or every timestamp would be shifted.
+                proxy_start = float(tracking.trim_offset_s or 0.0)
+                proxy_end = proxy_start + float(tracking.duration_s) if tracking.duration_s else None
+                print(f"[proxy] Reused run has no proxy; rebuilding it for the tracked window "
+                      f"{proxy_start:.2f}s-{proxy_end if proxy_end is not None else 'end'}")
+            _unlink_proxy_targets(output_dir, eff_proxy_h)
             proxy = _fs.build_proxy(
-                video_path, output_dir, height=eff_proxy_h, trim_start=trim_start, trim_end=trim_end,
+                video_path, output_dir, height=eff_proxy_h, trim_start=proxy_start, trim_end=proxy_end,
                 thumbs=True, audio_wav=True, progress_cb=tracker.module_callback("proxy"),
                 cancel_event=cancel_event,
             )
@@ -1996,8 +2043,8 @@ def _process_video_highlights_impl(
         _check_cancel(cancel_event)
 
         def _render_info_cb(info: Dict[str, object]) -> None:
-            if cancel_event is not None and cancel_event.is_set():
-                raise PipelineCancelled("Run canceled during render")
+            # Cancel is handled by the renderer itself (cancel_event): it kills
+            # ffmpeg and starts no further chunk; never raise from here.
             total = float(info.get("total") or 0) or 1.0
             tracker.update(float(info.get("frame") or 0) / total, None,
                            {"fps_processing": info.get("fps"), "eta_s": info.get("eta_s"),
@@ -2009,9 +2056,9 @@ def _process_video_highlights_impl(
                     video_path=original_video, output_path=os.path.join(output_dir, "debug_camera_wide.mp4"),
                     plan=camera_plan, include_audio=True, debug_wide=True, geometry=field_geometry,
                     debug_source_path=processing_video, debug_source_time_offset=0.0,
-                    source_time_offset=trim_offset,
+                    source_time_offset=trim_offset, cancel_event=cancel_event,
                 )
-            except PipelineCancelled:
+            except (PipelineCancelled, _cr.RenderCancelled):
                 raise
             except Exception as exc:
                 print(f"[warn] Debug video render failed: {exc}")
@@ -2040,8 +2087,11 @@ def _process_video_highlights_impl(
         t0 = time.monotonic()
         scorebug_fn = None
         if scorebug and follow_mode:
+            # Credit by scoring TEAM (stats attribution); the goal side alone
+            # is wrong after the half-time end swap.
             scorebug_fn = _cr.make_scorebug_renderer(
-                [{"t": g.t, "side": g.side} for g in goal_events], team_left=team_left, team_right=team_right,
+                [{"t": g.t, "side": g.side, "team": _goal_team(g.t)} for g in goal_events],
+                team_left=team_left, team_right=team_right,
             )
         full_follow_cam_path: Optional[str] = None
         if render_full_follow_cam and follow_mode and camera_plan is not None:
@@ -2057,7 +2107,7 @@ def _process_video_highlights_impl(
                     video_path=original_video, output_path=os.path.join(output_dir, "full_follow_ball_zoom.mp4"),
                     plan=camera_plan, include_audio=True, scorebug_fn=scorebug_fn, geometry=field_geometry,
                     output_size=render_size, source_time_offset=trim_offset, encoder="auto", hwaccel="auto",
-                    engine="ffmpeg", progress_info_callback=_render_info_cb,
+                    engine="ffmpeg", progress_info_callback=_render_info_cb, cancel_event=cancel_event,
                 )
             print(f"[4/6] Full game-camera movie: {full_follow_cam_path}")
         elif render_full_follow_cam and not follow_mode:
@@ -2073,6 +2123,11 @@ def _process_video_highlights_impl(
         t0 = time.monotonic()
         plan_clips = list(reel_plan.get("clips") or [])
         rendered: List[Tuple[Dict[str, object], str]] = []
+        # Wide clips at output_height: cut from the proxy (window time, no
+        # source decode) when it is tall enough, else from the source with a
+        # downscale. Never at source resolution.
+        wide_from_proxy = bool(processing_video and os.path.isfile(processing_video)
+                               and int(proxy.height or 0) >= eff_out_h)
         for n, clip in enumerate(plan_clips, start=1):
             _check_cancel(cancel_event)
             s, e = float(clip["t_start"]), float(clip["t_end"])
@@ -2084,12 +2139,16 @@ def _process_video_highlights_impl(
                     path = _cr.render_camera_plan_video(
                         video_path=original_video, output_path=out_path, plan=_cp.slice_plan(camera_plan, s, e),
                         include_audio=True, scorebug_fn=scorebug_fn, geometry=field_geometry,
-                        output_size=render_size, source_time_offset=trim_offset,
+                        output_size=render_size, source_time_offset=trim_offset, cancel_event=cancel_event,
                     )
+                elif wide_from_proxy:
+                    path = render_clip_ffmpeg(processing_video, out_path, s, e,
+                                              scale_height=eff_out_h if int(proxy.height) > eff_out_h else None)
                 else:
-                    path = render_clip_ffmpeg(original_video, out_path, s + trim_offset, e + trim_offset)
+                    path = render_clip_ffmpeg(original_video, out_path, s + trim_offset, e + trim_offset,
+                                              scale_height=eff_out_h if H > eff_out_h else None)
                 rendered.append((clip, path))
-            except PipelineCancelled:
+            except (PipelineCancelled, _cr.RenderCancelled):
                 raise
             except Exception as clip_exc:
                 print(f"[warn] Highlight clip {n} ({s:.1f}s - {e:.1f}s) failed: {clip_exc}")
@@ -2107,12 +2166,14 @@ def _process_video_highlights_impl(
         _timed("clips_reel", t0)
 
         if overlay and traj:
-            original_intervals = [(float(c["t_start"]) + trim_offset, float(c["t_end"]) + trim_offset)
-                                  for c, _ in rendered]
+            # Optional legacy overlay: drawn on the PROXY (never decodes the
+            # 4K source) in window time; track points are source pixels, so
+            # they are scaled to the proxy.
+            window_intervals = [(float(c["t_start"]), float(c["t_end"])) for c, _ in rendered]
             overlay_workers = min(2, threads) if threads else None
             try:
-                draw_spotlight_overlay(original_video, traj, original_intervals, output_dir,
-                                       max_workers=overlay_workers)
+                draw_spotlight_overlay(processing_video, traj, window_intervals, output_dir,
+                                       max_workers=overlay_workers, xy_scale=float(proxy.scale or 1.0))
             except Exception as overlay_exc:
                 print(f"[warn] Spotlight overlays failed: {overlay_exc}")
 
@@ -2133,7 +2194,7 @@ def _process_video_highlights_impl(
         emit_progress(progress_callback, "completed", 0.99, "Run complete", {"clip_count": len(clip_paths)})
         return True
 
-    except (PipelineCancelled, _fs.ProxyCancelled) as cancel_exc:
+    except (PipelineCancelled, _fs.ProxyCancelled, _cr.RenderCancelled) as cancel_exc:
         print(f"[cancel] {cancel_exc}")
         tracker.finish("canceled", "Run canceled")
         emit_progress(progress_callback, "canceled", 1.0, "Run canceled", {"cancelled": True})

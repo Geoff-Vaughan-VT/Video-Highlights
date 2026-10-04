@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Generator
 
@@ -9,6 +10,12 @@ from fastapi.testclient import TestClient
 from backend.config import settings
 from backend.database import reset_db, set_engine
 from backend.main import app
+
+# API jobs always write to <output_root>/<job_id> (backend/schemas.py
+# output_dir_override_allowed). Several suites seed run folders through
+# config.output_dir, which needs the test-only override; the path-policy
+# tests (tests/test_job_config.py, tests/test_path_policy.py) switch it off.
+os.environ.setdefault("VH_ALLOW_OUTPUT_DIR_OVERRIDE", "1")
 
 
 @pytest.fixture(scope="function")
