@@ -35,6 +35,10 @@ def client(isolated_db: str) -> Generator[TestClient, None, None]:
     settings.jwt_secret = None
     settings.jwt_issuer = "video-highlights"
     settings.jwt_audience = None
+    settings.upload_max_gb = 3.0
+    settings.upload_extended_max_gb = 8.0
+    settings.upload_min_duration_seconds = 0.0
+    settings.notify_backend = "console"
     settings.clear_api_token_cache()
     with TestClient(app) as test_client:
         yield test_client
@@ -56,6 +60,10 @@ def auth_client(isolated_db: str) -> Generator[TestClient, None, None]:
     settings.jwt_secret = "test-jwt-secret-32-char-minimum-key"
     settings.jwt_issuer = "video-highlights"
     settings.jwt_audience = None
+    settings.upload_max_gb = 3.0
+    settings.upload_extended_max_gb = 8.0
+    settings.upload_min_duration_seconds = 0.0
+    settings.notify_backend = "console"
     settings.clear_api_token_cache()
     with TestClient(app) as test_client:
         yield test_client

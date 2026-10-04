@@ -64,3 +64,60 @@ This file confirms coverage of requirements provided in the planning context.
 | Collaboration and governance | `FR-COLLAB-01` to `FR-COLLAB-04` | Phase 6 | Captured |
 | Enterprise-grade security and compliance | `NFR-SEC-02`, `NFR-SEC-03`, `NFR-COMP-01`, `NFR-DATA-02` | Phase 5 | Captured |
 | LLM governance and provider flexibility | `NFR-AGENT-01` to `NFR-AGENT-03` | Phase 5 | Captured |
+
+## Customer FAQ Requirement Coverage (August 2026)
+
+Requirements extracted from the customer-facing FAQ document.
+
+| FAQ requirement | Coverage in PRD | Roadmap phase | Status |
+|---|---|---|---|
+| Baseline 15 per-team stats every match (goals, assists, possession, shots, shots on target, saves, offsides, passes, pass accuracy, key passes, duels, fouls, corners, free kicks, penalties) | `FR-STATS-01`, `FR-STATS-02` | Phase 3 | Captured |
+| Premium off-the-ball and individual player stats | `FR-STATS-03`, `FR-ROSTER-02` | Phase 4 | Captured |
+| Raw file uploads preferred; full stat coverage from raw files | `FR-INGEST-05`, `FR-SOURCE-03` | Phase 2, Phase 4 | Captured |
+| Public link ingest (YouTube, Vimeo, VEO, Hudl, Pixellot, XbotGo, NBC Sports Engine) | `FR-SOURCE-01` | Phase 4 | Captured |
+| Reduced/variable stat coverage from link sources, disclosed to users | `FR-SOURCE-02` to `FR-SOURCE-04`, `FR-STATS-04` | Phase 4 | Captured |
+| Drag-and-drop MP4 upload up to 3 GB; paid tier up to 8 GB | `FR-INGEST-05`, `FR-INGEST-06`, `FR-PLAN-02` | Phase 2, Phase 6 | Captured |
+| 30-minute minimum video length | `FR-INGEST-07` | Phase 2 | Captured |
+| iPhone/iPad and Android filmed video supported | `FR-INGEST-08` | Phase 2 | Captured |
+| 4-6 hour average processing turnaround | `NFR-SLA-01`, `FR-UI-12` | Phase 2, Phase 5 | Captured |
+| Email notification when match is ready (spam-folder caveat) | `FR-NOTIFY-01`, `FR-NOTIFY-03` | Phase 2, Phase 5 | Captured |
+| 100% automated analysis, nothing to learn | `FR-GUIDE-03`, `FR-UI-04` | Phase 2 | Captured |
+| Roster upload after team stats (name, jersey number, position, email) via template | `FR-ROSTER-01` | Phase 3 | Captured |
+| Automatic highlight routing to players by jersey number | `FR-ROSTER-02`, `FR-PLAYER-02` | Phase 4 | Captured |
+| Player card emailed to each rostered player | `FR-ROSTER-03`, `FR-NOTIFY-02` | Phase 4 | Captured |
+| Premium player stats ready 24-48 hours after team stats | `NFR-SLA-02` | Phase 5 | Captured |
+| Saved roster library in profile (avoid re-entry per match) | `FR-ROSTER-05` | Phase 4 | Captured |
+| Single-player roster for one-player highlights | `FR-ROSTER-06` | Phase 3 | Captured |
+| Unassigned highlights remain shareable when routing misses | `FR-ROSTER-04`, `FR-SHARE-01` | Phase 3 | Captured |
+| Public share link for full match and individual stats | `FR-SHARE-01` | Phase 3 | Captured |
+| Download, keep, and re-share results forever after analysis | `FR-STATS-05`, `FR-SHARE-03` | Phase 3 | Captured |
+| Direct social posting (Facebook, X, TikTok, Instagram) | `FR-SHARE-02`, `FR-DIST-01` | Phase 6 | Captured |
+| Plans tab with self-service upgrade/downgrade and cancellation policy | `FR-PLAN-01`, `FR-PLAN-05` | Phase 6 | Captured |
+| Receive-only player accounts (monthly subscription, no uploads) | `FR-PLAN-03` | Phase 6 | Captured |
+| Per-match pricing and paid oversize-upload add-on | `FR-PLAN-02`, `FR-PLAN-04` | Phase 6 | Captured |
+| Predictive analysis after 3+ matches (xG, xGA, xS, xG + xA, win-draw-loss) | `FR-PREDICT-01` to `FR-PREDICT-03` | Phase 4 | Captured |
+| Filming guidance (midfield placement, lighting, 15-45 degree angle, drones to 90 degrees, obstructions) | `FR-GUIDE-01` | Phase 3 | Captured |
+| Film quality drives stat quality; 1080p/4K needed for jersey reading | `FR-GUIDE-02`, `FR-QA-01` | Phase 3, Phase 4 | Captured |
+| In-app chat bubble and contact-us support | `FR-SUPPORT-01`, `FR-SUPPORT-03` | Phase 5 | Captured |
+| Note-taking area under the match viewer | `FR-SUPPORT-02` | Phase 3 | Captured |
+| Secure, private-by-default storage; GDPR compliant | `NFR-COMP-02`, `NFR-SEC-01` | Phase 5 | Captured |
+| Users must hold legal rights to analyze film | `NFR-COMP-03` | Phase 5 | Captured |
+
+## UI Overhaul Coverage
+
+The current UI is a single-file developer Studio (`frontend/index.html`) with a hardcoded tenant and no authentication UX. These requirements define the production replacement.
+
+| UI work area | Coverage in PRD | Roadmap phase | Status |
+|---|---|---|---|
+| Production web app replacing single-file Studio | `FR-UI-01` | Phase 2 | Captured |
+| Sign-up/login/password-reset, no hardcoded tenant | `FR-UI-02` | Phase 2 | Captured |
+| Responsive, mobile-first layouts | `FR-UI-03` | Phase 2 | Captured |
+| Guided upload UX (drag-and-drop, resumable, validation, link paste) | `FR-UI-04` | Phase 2 | Captured |
+| Stats dashboard with per-stat evidence drilldown | `FR-UI-05` | Phase 3 | Captured |
+| Roster management UI with routing status | `FR-UI-06` | Phase 3 | Captured |
+| Plans and billing surface | `FR-UI-07` | Phase 6 | Captured |
+| Share center (links, social, reports, player cards) | `FR-UI-08` | Phase 3 | Captured |
+| Notifications center and email preferences | `FR-UI-09` | Phase 3 | Captured |
+| Accessibility (WCAG 2.1 AA) and design system | `FR-UI-10` | Phase 3 | Captured |
+| First-run onboarding, empty states, filming tips | `FR-UI-11` | Phase 3 | Captured |
+| Stage-level progress and SLA messaging for long jobs | `FR-UI-12` | Phase 2 | Captured |

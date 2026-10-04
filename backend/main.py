@@ -13,7 +13,21 @@ from .database import init_db, session_scope
 from .logging_utils import configure_runtime_logging
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
-from .routers import admin_global, admin_tenant, agent, auth, events, feedback, health, jobs, matches, studio, training
+from .routers import (
+    admin_global,
+    admin_tenant,
+    agent,
+    auth,
+    events,
+    feedback,
+    health,
+    jobs,
+    matches,
+    roster,
+    sharing,
+    studio,
+    training,
+)
 from .services.job_runner import recover_interrupted_inline_jobs
 from .tenant import ensure_seed_tenants
 from .utils import generate_id
@@ -93,6 +107,10 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix="/v1")
     app.include_router(admin_global.router, prefix="/v1")
     app.include_router(admin_tenant.router, prefix="/v1")
+    # roster must register before matches: its static /matches/roster-template.csv
+    # route would otherwise be shadowed by matches' /matches/{match_id}.
+    app.include_router(roster.router, prefix="/v1")
+    app.include_router(sharing.router, prefix="/v1")
     app.include_router(matches.router, prefix="/v1")
     app.include_router(jobs.router, prefix="/v1")
     app.include_router(events.router, prefix="/v1")

@@ -287,6 +287,214 @@ class AudioEditRead(BaseModel):
     created_at: str
 
 
+RosterTeamSide = Literal["home", "away"]
+
+
+class RosterEntryCreate(BaseModel):
+    player_name: str
+    jersey_number: str
+    position: Optional[str] = None
+    email: Optional[str] = None
+    team_side: RosterTeamSide = "home"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RosterEntryPatch(BaseModel):
+    player_name: Optional[str] = None
+    jersey_number: Optional[str] = None
+    position: Optional[str] = None
+    email: Optional[str] = None
+    team_side: Optional[RosterTeamSide] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class RosterEntryRead(BaseModel):
+    roster_entry_id: str
+    tenant_id: Optional[str] = None
+    match_id: str
+    player_name: str
+    jersey_number: str
+    position: Optional[str] = None
+    email: Optional[str] = None
+    team_side: str = "home"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class RosterImportRequest(BaseModel):
+    csv_text: str
+    team_side: RosterTeamSide = "home"
+    replace_existing: bool = False
+
+
+class RosterImportError(BaseModel):
+    line: int
+    issue: str
+
+
+class RosterImportResult(BaseModel):
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    errors: List[RosterImportError] = Field(default_factory=list)
+    entries: List[RosterEntryRead] = Field(default_factory=list)
+
+
+class EventAssignRequest(BaseModel):
+    roster_entry_id: Optional[str] = None  # null clears the assignment
+
+
+class StatValue(BaseModel):
+    key: str
+    label: str
+    unit: Literal["count", "percent"] = "count"
+    available: bool = False
+    reason: Optional[str] = None
+    method: Optional[str] = None
+    home: Optional[float] = None
+    away: Optional[float] = None
+    unattributed: Optional[float] = None
+    total: Optional[float] = None
+    raw: Dict[str, Any] = Field(default_factory=dict)
+    event_ids: List[str] = Field(default_factory=list)
+
+
+class MatchStatsRead(BaseModel):
+    match_id: str
+    job_id: Optional[str] = None
+    teams: Dict[str, Optional[str]] = Field(default_factory=dict)
+    generated_at: str
+    analysis: Dict[str, Any] = Field(default_factory=dict)
+    stats: List[StatValue] = Field(default_factory=list)
+
+
+ShareScope = Literal["match", "highlight", "player_card"]
+
+
+class ShareLinkCreate(BaseModel):
+    scope: ShareScope = "match"
+    event_id: Optional[str] = None
+    roster_entry_id: Optional[str] = None
+    label: Optional[str] = None
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
+
+
+class ShareLinkRead(BaseModel):
+    share_id: str
+    token: str
+    url_path: str
+    tenant_id: Optional[str] = None
+    match_id: str
+    scope: str
+    event_id: Optional[str] = None
+    roster_entry_id: Optional[str] = None
+    label: Optional[str] = None
+    revoked: bool = False
+    expires_at: Optional[datetime] = None
+    view_count: int = 0
+    created_at: datetime
+
+
+class RosterTemplateEntry(BaseModel):
+    player_name: str
+    jersey_number: str
+    position: Optional[str] = None
+    email: Optional[str] = None
+    team_side: RosterTeamSide = "home"
+
+
+class RosterTemplateCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    entries: List[RosterTemplateEntry] = Field(default_factory=list)
+
+
+class RosterTemplateFromMatch(BaseModel):
+    name: str
+    description: Optional[str] = None
+    team_side: Optional[RosterTeamSide] = None
+
+
+class RosterTemplateApply(BaseModel):
+    team_side: Optional[RosterTeamSide] = None
+    replace_existing: bool = False
+
+
+class RosterTemplateRead(BaseModel):
+    template_id: str
+    tenant_id: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    entries: List[RosterTemplateEntry] = Field(default_factory=list)
+    entry_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlayerCardStat(BaseModel):
+    key: str
+    label: str
+    count: int = 0
+
+
+class PlayerCardRead(BaseModel):
+    match_id: str
+    roster_entry_id: str
+    player_name: str
+    jersey_number: str
+    position: Optional[str] = None
+    team_side: str = "home"
+    team_name: Optional[str] = None
+    match_name: Optional[str] = None
+    match_date: Optional[str] = None
+    highlight_count: int = 0
+    stats: List[PlayerCardStat] = Field(default_factory=list)
+    highlights: List[Dict[str, Any]] = Field(default_factory=list)
+    share_url_path: Optional[str] = None
+
+
+class RoutingResult(BaseModel):
+    match_id: str
+    routed: int = 0
+    already_routed: int = 0
+    unmatched_jersey_numbers: List[str] = Field(default_factory=list)
+    unassigned_remaining: int = 0
+    roster_size: int = 0
+
+
+class PlayerCardSendResult(BaseModel):
+    match_id: str
+    sent: int = 0
+    skipped: int = 0
+    details: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class NotificationRead(BaseModel):
+    notification_id: str
+    tenant_id: Optional[str] = None
+    match_id: Optional[str] = None
+    job_id: Optional[str] = None
+    channel: str
+    backend: str
+    recipient: Optional[str] = None
+    subject: str
+    status: str
+    error_message: Optional[str] = None
+    created_at: datetime
+
+
+class UploadPolicyRead(BaseModel):
+    max_upload_bytes: int
+    max_upload_gb: float
+    extended_max_upload_bytes: int
+    extended_max_upload_gb: float
+    extended_upload_enabled: bool = False
+    min_duration_seconds: float = 0.0
+    allowed_extensions: List[str] = Field(default_factory=list)
+    processing_sla_hours: List[int] = Field(default_factory=list)
+
+
 class FeedbackSubmittedBy(BaseModel):
     user_id: Optional[str] = None
     role: Optional[ReviewerRole] = None

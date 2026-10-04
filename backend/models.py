@@ -123,6 +123,81 @@ class Event(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utcnow, nullable=False)
 
 
+class RosterEntry(SQLModel, table=True):
+    __tablename__ = "roster_entries"
+    __table_args__ = (
+        UniqueConstraint("match_id", "team_side", "jersey_number", name="uq_roster_match_side_jersey"),
+    )
+
+    id: str = Field(default_factory=lambda: generate_id("roster"), primary_key=True)
+    tenant_id: Optional[str] = Field(default=None, foreign_key="tenants.id", index=True)
+    match_id: str = Field(foreign_key="matches.id", index=True)
+    player_name: str = Field(index=True)
+    jersey_number: str = Field(index=True)
+    position: Optional[str] = Field(default=None)
+    email: Optional[str] = Field(default=None)
+    team_side: str = Field(default="home", index=True)  # home|away
+    metadata_json: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=utcnow, nullable=False)
+
+
+class RosterTemplate(SQLModel, table=True):
+    """Reusable roster saved on the tenant so teams do not re-enter players
+    for every match (FR-ROSTER-05)."""
+
+    __tablename__ = "roster_templates"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_roster_template_name"),)
+
+    id: str = Field(default_factory=lambda: generate_id("rtpl"), primary_key=True)
+    tenant_id: Optional[str] = Field(default=None, foreign_key="tenants.id", index=True)
+    name: str = Field(index=True)
+    description: Optional[str] = Field(default=None)
+    entries_json: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    created_by_user_id: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=utcnow, nullable=False)
+
+
+class ShareLink(SQLModel, table=True):
+    """Public, tokenized view of a match, a single highlight, or a player
+    card. Viewable without an account (FR-SHARE-01)."""
+
+    __tablename__ = "share_links"
+
+    id: str = Field(default_factory=lambda: generate_id("share"), primary_key=True)
+    token: str = Field(index=True, unique=True)
+    tenant_id: Optional[str] = Field(default=None, foreign_key="tenants.id", index=True)
+    match_id: str = Field(foreign_key="matches.id", index=True)
+    scope: str = Field(default="match", index=True)  # match|highlight|player_card
+    event_id: Optional[str] = Field(default=None, foreign_key="events.id", index=True)
+    roster_entry_id: Optional[str] = Field(default=None, foreign_key="roster_entries.id", index=True)
+    label: Optional[str] = Field(default=None)
+    revoked: bool = Field(default=False, index=True)
+    expires_at: Optional[datetime] = Field(default=None)
+    view_count: int = Field(default=0)
+    last_viewed_at: Optional[datetime] = Field(default=None)
+    created_by_user_id: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utcnow, nullable=False)
+
+
+class NotificationLog(SQLModel, table=True):
+    __tablename__ = "notification_logs"
+
+    id: str = Field(default_factory=lambda: generate_id("notify"), primary_key=True)
+    tenant_id: Optional[str] = Field(default=None, foreign_key="tenants.id", index=True)
+    match_id: Optional[str] = Field(default=None, foreign_key="matches.id", index=True)
+    job_id: Optional[str] = Field(default=None, foreign_key="processing_jobs.id", index=True)
+    channel: str = Field(default="email", index=True)
+    backend: str = Field(default="console", index=True)
+    recipient: Optional[str] = Field(default=None, index=True)
+    subject: str = Field(default="")
+    body: str = Field(default="")
+    status: str = Field(default="sent", index=True)  # sent|skipped|failed
+    error_message: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=utcnow, nullable=False, index=True)
+
+
 class EventFeedback(SQLModel, table=True):
     __tablename__ = "event_feedback"
 

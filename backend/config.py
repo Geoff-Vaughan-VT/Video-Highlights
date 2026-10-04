@@ -43,6 +43,22 @@ class Settings:
     log_level: str = os.getenv("VH_LOG_LEVEL", "DEBUG" if test_mode else "INFO").upper()
     job_log_detail: str = os.getenv("VH_JOB_LOG_DETAIL", "extreme" if test_mode else "basic").lower()
     persist_job_logs: bool = os.getenv("VH_PERSIST_JOB_LOGS", "true").lower() in {"1", "true", "yes"}
+    # Upload policy (FR-INGEST-05..07): standard cap, entitlement-gated extended cap,
+    # and an optional minimum-duration gate (0 disables; set 1800 for the 30-minute product rule).
+    upload_max_gb: float = float(os.getenv("VH_UPLOAD_MAX_GB", "3"))
+    upload_extended_max_gb: float = float(os.getenv("VH_UPLOAD_EXTENDED_MAX_GB", "8"))
+    upload_min_duration_seconds: float = float(os.getenv("VH_UPLOAD_MIN_DURATION_SECONDS", "0"))
+    # Customer-facing processing turnaround target (NFR-SLA-01), surfaced in the UI.
+    processing_sla_hours_min: int = int(os.getenv("VH_PROCESSING_SLA_HOURS_MIN", "4"))
+    processing_sla_hours_max: int = int(os.getenv("VH_PROCESSING_SLA_HOURS_MAX", "6"))
+    # Completion notifications (FR-NOTIFY-01): console logs by default, smtp for real email.
+    notify_backend: str = os.getenv("VH_NOTIFY_BACKEND", "console").lower()  # console|smtp|disabled
+    smtp_host: str | None = os.getenv("VH_SMTP_HOST")
+    smtp_port: int = int(os.getenv("VH_SMTP_PORT", "587"))
+    smtp_username: str | None = os.getenv("VH_SMTP_USERNAME")
+    smtp_password: str | None = os.getenv("VH_SMTP_PASSWORD")
+    smtp_from: str = os.getenv("VH_SMTP_FROM", "no-reply@video-highlights.local")
+    smtp_starttls: bool = os.getenv("VH_SMTP_STARTTLS", "true").lower() in {"1", "true", "yes"}
 
     @property
     @lru_cache(maxsize=1)

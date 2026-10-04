@@ -5,7 +5,10 @@ from .models import (
     EventFeedback,
     JobLogEntry,
     Match,
+    NotificationLog,
     ProcessingJob,
+    RosterEntry,
+    RosterTemplate,
     Tenant,
     TenantMembership,
     TrainingFeedbackBatch,
@@ -19,6 +22,10 @@ from .schemas import (
     JobRead,
     JobLogRead,
     MatchRead,
+    NotificationRead,
+    RosterEntryRead,
+    RosterTemplateEntry,
+    RosterTemplateRead,
     TenantMembershipRead,
     TenantRead,
     TrainingRunRead,
@@ -98,6 +105,57 @@ def event_to_read(event: Event) -> EventRead:
         explanations=event.explanations_json or [],
         created_at=event.created_at,
         updated_at=event.updated_at,
+    )
+
+
+def roster_to_read(entry: RosterEntry) -> RosterEntryRead:
+    return RosterEntryRead(
+        roster_entry_id=entry.id,
+        tenant_id=entry.tenant_id,
+        match_id=entry.match_id,
+        player_name=entry.player_name,
+        jersey_number=entry.jersey_number,
+        position=entry.position,
+        email=entry.email,
+        team_side=entry.team_side,
+        metadata=entry.metadata_json or {},
+        created_at=entry.created_at,
+        updated_at=entry.updated_at,
+    )
+
+
+def roster_template_to_read(template: RosterTemplate) -> RosterTemplateRead:
+    entries = []
+    for raw in list(template.entries_json or []):
+        try:
+            entries.append(RosterTemplateEntry(**raw))
+        except Exception:
+            continue
+    return RosterTemplateRead(
+        template_id=template.id,
+        tenant_id=template.tenant_id,
+        name=template.name,
+        description=template.description,
+        entries=entries,
+        entry_count=len(entries),
+        created_at=template.created_at,
+        updated_at=template.updated_at,
+    )
+
+
+def notification_to_read(entry: NotificationLog) -> NotificationRead:
+    return NotificationRead(
+        notification_id=entry.id,
+        tenant_id=entry.tenant_id,
+        match_id=entry.match_id,
+        job_id=entry.job_id,
+        channel=entry.channel,
+        backend=entry.backend,
+        recipient=entry.recipient,
+        subject=entry.subject,
+        status=entry.status,
+        error_message=entry.error_message,
+        created_at=entry.created_at,
     )
 
 

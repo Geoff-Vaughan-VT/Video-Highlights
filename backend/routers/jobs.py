@@ -10,9 +10,9 @@ from sqlmodel import Session, select
 from ..auth import UserContext, require_roles
 from ..config import settings
 from ..database import get_session
-from ..models import Event, JobLogEntry, Match, ProcessingJob
+from ..models import Event, JobLogEntry, Match, NotificationLog, ProcessingJob
 from ..schemas import JobCreate, JobRead, JobRerunRequest
-from ..serializers import job_log_to_read, job_to_read
+from ..serializers import job_log_to_read, job_to_read, notification_to_read
 from ..services.job_logging import append_job_log
 from ..services.job_runner import job_runner
 from ..tenant import TenantContext, get_tenant_context
@@ -423,6 +423,26 @@ def list_job_logs(
     rows = list(session.exec(stmt))
     items = [job_log_to_read(item).model_dump() for item in rows]
     return {"items": items}
+
+
+@router.get("/jobs/{job_id}/notifications", response_model=Dict[str, object])
+def list_job_notifications(
+    job_id: str,
+    limit: int = Query(default=50, ge=1, le=500),
+    session: Session = Depends(get_session),
+    _: UserContext = Depends(require_roles("admin", "analyst", "coach", "parent", "system", "tenant_admin")),
+    tenant: TenantContext = Depends(get_tenant_context),
+) -> Dict[str, object]:
+    _get_tenant_job_or_404(session, tenant.tenant_id, job_id)
+    stmt = (
+        select(NotificationLog)
+        .where(NotificationLog.job_id == job_id)
+        .where(NotificationLog.tenant_id == tenant.tenant_id)
+        .order_by(NotificationLog.created_at.desc())
+        .limit(limit)
+    )
+    rows = list(session.exec(stmt))
+    return {"items": [notification_to_read(item).model_dump() for item in rows]}
 
 
 @router.get("/jobs/{job_id}/diagnostics", response_model=Dict[str, object])

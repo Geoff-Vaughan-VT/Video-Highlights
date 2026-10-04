@@ -255,6 +255,7 @@ def list_events(
     player_id: Optional[str] = Query(default=None),
     period: Optional[str] = Query(default=None),
     min_confidence: Optional[float] = Query(default=None, ge=0.0, le=1.0),
+    assigned: Optional[bool] = Query(default=None),
     from_ms: Optional[int] = Query(default=None, ge=0),
     to_ms: Optional[int] = Query(default=None, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
@@ -281,6 +282,8 @@ def list_events(
         stmt = stmt.where(Event.period == period)
     if min_confidence is not None:
         stmt = stmt.where(Event.confidence >= min_confidence)
+    if assigned is not None:
+        stmt = stmt.where(Event.player_id.is_not(None) if assigned else Event.player_id.is_(None))  # type: ignore[union-attr]
     if from_ms is not None:
         stmt = stmt.where(Event.occurred_at_ms >= from_ms)
     if to_ms is not None:
