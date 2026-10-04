@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,9 +30,14 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid ISO date: {value}") from exc
+    # Stored timestamps are timezone-aware (UTC); a date-only or naive input
+    # is interpreted as UTC so the comparison is valid on every backend.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 @router.post("/feedback-batches", response_model=FeedbackBatchRead, status_code=201)
