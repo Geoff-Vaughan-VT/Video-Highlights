@@ -1,4 +1,4 @@
 @echo off
 setlocal
-
-python -m pytest --cov=backend --cov-report=term-missing
+cd /d "%~dp0"
+python -m pytest -q -p no:cacheprovider %*

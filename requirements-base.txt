@@ -1,0 +1,17 @@
+# API + worker control plane (no ML stack). Enough to run the FastAPI app,
+# the queue worker loop, storage, auth, notifications and most tests.
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+sqlmodel>=0.0.22
+python-multipart>=0.0.9
+requests>=2.32.0
+PyJWT>=2.9.0
+openai>=1.30.0
+boto3>=1.36.0
+# Postgres driver for VH_DB_URL=postgresql+psycopg://... (cloud profile).
+psycopg[binary]>=3.1
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+tqdm>=4.60.0
+psutil>=5.8.0
+PyYAML>=6.0

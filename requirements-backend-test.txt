@@ -1,16 +1,7 @@
-# Lightweight dependency set for backend/API tests and CI.
-# numpy/opencv/tqdm are required because backend services (follow_cam,
-# game_tracking, camera_planner, camera_render) and the VideoHighlights
-# pipeline module import them at module level.
-numpy>=1.19.0
-opencv-python-headless>=4.5.0
-tqdm>=4.60.0
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-sqlmodel>=0.0.22
-openai>=1.30.0
-python-multipart>=0.0.9
-requests>=2.32.0
+# Lightweight API-only test set (no torch/ultralytics). Most of the suite runs
+# with this; tests that need the ML stack skip or fail without it, so CI uses
+# requirements-dev.txt instead.
+-r requirements-base.txt
 pytest>=8.3.0
 pytest-cov>=6.0.0
-PyJWT>=2.9.0
+httpx>=0.27.0

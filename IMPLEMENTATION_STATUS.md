@@ -1,6 +1,24 @@
 # Implementation Status
 
-This file tracks concrete implementation progress against the documented V1 architecture and requirements.
+This file tracks concrete implementation progress against the documented architecture and requirements. v1 history is kept below; the v2 rebuild (`PLAN.md`) is tracked in the first section.
+
+> **Streamlit portals removed.** `app.py`, `app_api.py`, `app_admin_global.py`, `app_admin_tenant.py` and their launchers (`run_web.sh`, `run_admin_*`) no longer exist; the Studio web UI served by the API at `/` (`frontend/`) replaces them. Items below that mention Streamlit are historical.
+
+## v2 rebuild: platform, containers, profiles, bench (workstream F)
+
+1. Added processing profiles `fast` / `balanced` / `quality` (`backend/services/perf_profiles.py`) matching `docs/ARTIFACTS.md`; `resolve_job_config` layers profile defaults under explicit job keys; `VH_MODEL_FAMILY` swaps yolov8 weights for yolo11/yolo26 of the same size; `resolve_model_path` finds weights in `VH_MODEL_DIR`.
+2. Added a per-stage runtime model (`estimate_runtime`: proxy, detect+track, analysis, render, clips+reel) for hardware classes `rtx_4090`, `rtx_4080`, `rtx_3080`, `dgx_spark`, `apple_m2_ultra`, `apple_m1_max`, `cpu_8core`, plus `classify_hardware`.
+3. Extended `GET /v1/health/gpu` (`gpu_status.py`): `mps_available`, ffmpeg `hwaccels` and `encoders`, `recommended_device` (honours `VH_DEVICE`), `recommended_encoder`, `recommended_hwaccel`, `platform`, `hardware_class`; v1 keys unchanged.
+4. Rebuilt the images: multi-stage CPU `Dockerfile` (CPU torch index) and `Dockerfile.gpu` (CUDA base image, `TORCH_INDEX` cu128/cu130, optional TensorRT), non-root `vh`, `tini`, `HEALTHCHECK`, weights baked into `/models`, no test deps in runtime, allow-list `.dockerignore`.
+5. Rewrote `docker-compose.yml`: `api`, `worker`, `worker-gpu` (profile `gpu`), `postgres` (profile `cloud`); named volumes `vh-data` (`/data`) and `vh-models` (`/models`), read-only media mount `${VH_MEDIA_DIR}:/media`, `.env` support, healthcheck-gated startup, production logging defaults. Added `.env.example` documenting every `VH_*` variable.
+6. `docker/start_all.sh` starts API + worker only, waits on `/v1/health`, forwards signals and exit codes. Fixed `run_docker*`/`stop_docker*` service names and profiles; removed dead Streamlit launchers.
+7. Native runners: `scripts/run_native_mac.sh` (MPS + VideoToolbox), `scripts/run_native_windows.ps1` / `run_native_windows.bat` (cu128, API + worker), `scripts/run_native_linux.sh` (cu130 on aarch64/Spark, cu128 on x86_64, CPU fallback); `scripts/download_models.py` (idempotent, offline-safe).
+8. Split requirements: `requirements-base.txt`, `requirements-ml.txt`, `requirements-dev.txt`; `requirements.txt` is the umbrella. Added `lap` (tracker dep, no runtime auto-install) and `psycopg[binary]` (Postgres).
+9. Added `bench/bench_match.py` (synthetic match -> proxy -> detection -> ffmpeg render timings -> 90-minute projection, JSON + Markdown in `bench/results/`).
+10. CI: `tests` job (CPU torch, ffmpeg, script/compose sanity, pytest) and `bench-smoke` job with artifact upload; `docker-publish.yml` builds CPU (amd64+arm64), GPU amd64 (cu128) and GPU arm64 (cu130) on tags with GHA cache.
+11. Docs: README, LOCAL_SETUP, `docs/DEPLOYMENT.md`, TESTING, PERFORMANCE_* rewritten for v2.
+
+Open (tracked in `docs/DEPLOYMENT.md` limitations): non-atomic queue claim, no DB migrations, shared filesystem needed for run directories.
 
 ## Completed in This Pass
 
@@ -112,20 +130,21 @@ This file tracks concrete implementation progress against the documented V1 arch
 
 ## Validated
 
-1. `python -m compileall app.py VideoHighlights.py backend` succeeds.
+1. `python -m compileall VideoHighlights.py backend` succeeds.
 2. `python test_api_smoke.py` passes end-to-end for core API flow.
 3. `python test_api_auth_queue.py` passes for auth-required + queue-worker execution mode.
 4. `python -m pytest --basetemp .pytest_tmp` passes locally.
-5. Current automated test suite: 172 passing tests (3 skipped without ffmpeg/torch extras).
+5. Current automated test suite: 282 passing, 2 skipped (snapshot during the v2 workstreams; see TESTING.md).
 6. Multitenant + admin test paths pass in local pytest run.
-7. `python -m streamlit run app.py --server.headless true --server.port 8501 --browser.gatherUsageStats false` starts the portal locally.
+7. (removed) Streamlit portal check; the Studio UI is served by the API at `/`.
+8. `bash -n` passes for every shell script; `docker-compose.yml` and both workflows parse as YAML; `bench/bench_match.py --minutes 0.2 --height 360` runs end to end on CPU.
 
 ## Next Implementation Batch (Autonomous Queue)
 
 1. Add token revocation/rotation support and service-account style credentials for non-interactive clients.
 2. Add S3 bucket policy validation and startup health checks for remote storage dependencies.
 3. Add asynchronous worker-process integration tests with real subprocess lifecycle.
-4. Add CI stages for lint/type checks plus smoke tests (`test_api_smoke.py`, `test_api_auth_queue.py`).
+4. Add CI stages for lint/type checks plus smoke tests (`test_api_smoke.py`, `test_api_auth_queue.py`). Make the queue claim atomic so multiple workers can share a queue.
 5. Add OpenAPI contract snapshot checks to detect breaking API changes automatically.
 6. Add tenant-aware usage quotas and billing guardrails.
 7. Recognize jersey numbers from video so routing runs without manual assignment (completes `FR-ROSTER-02`); requires a jersey-number model and per-player crop extraction.

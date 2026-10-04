@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-python -m pytest --cov=backend --cov-report=term-missing
+cd "$(dirname "$0")"
+python -m pytest -q -p no:cacheprovider "$@"

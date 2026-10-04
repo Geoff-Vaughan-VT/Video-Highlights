@@ -1,0 +1,6 @@
+# Everything needed to run the full test suite and the bench locally / in CI.
+# CI installs CPU torch first: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+-r requirements-ml.txt
+pytest>=8.3.0
+pytest-cov>=6.0.0
+httpx>=0.27.0

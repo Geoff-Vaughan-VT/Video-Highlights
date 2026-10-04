@@ -1,19 +1,15 @@
-.git
-.github
-.pytest_cache
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.venv
-venv
-env
-ENV
-node_modules
-outputs
-storage
-video_highlights_v1.db
-.coverage
-.mypy_cache
-.ruff_cache
-.DS_Store
+# Allow-list style: only what the images COPY is sent to the daemon.
+*
+!backend/
+!frontend/
+!docker/
+!scripts/
+!VideoHighlights.py
+!requirements*.txt
+!yolov8n.pt
+
+# Never ship caches/bytecode even from allowed dirs.
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.DS_Store
