@@ -335,3 +335,52 @@ def test_calibration_path_safety(client, run_root):
             assert response.status_code in {400, 404, 405}, (run_id, method, response.status_code)
     assert not (run_root.parent / "calibration.json").exists()
     assert not (run_root.parent.parent / "calibration.json").exists()
+
+
+def test_match_asset_streaming_only_serves_server_managed_files(client, run_root, tmp_path, monkeypatch):
+    """A path recorded in client-editable match metadata must never be streamed
+    unless the storage backend wrote it under <local_storage_root>/<match_id>/."""
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    monkeypatch.setattr(settings, "local_storage_root", str(storage_root))
+
+    match = client.post("/v1/matches", json={"name": "Assets", "home_team_name": "H",
+                                              "away_team_name": "A", "source_video_path": "/tmp/x.mp4"}).json()
+    match_id = match["match_id"]
+
+    # A real file that an attacker could point at: the run's proxy under the output root.
+    victim = run_root / "proxy_1080p.mp4"
+    assert victim.is_file()
+    # A file inside the storage root but belonging to ANOTHER match.
+    other_dir = storage_root / "match_other"
+    other_dir.mkdir()
+    shutil.copy(victim, other_dir / "asset_x_clip.mp4")
+    # A legitimately stored asset for this match.
+    own_dir = storage_root / match_id
+    own_dir.mkdir()
+    shutil.copy(victim, own_dir / "asset_ok_reel.mp4")
+
+    # Paths under the output root are already refused by the media-path policy
+    # when metadata is patched (defence in depth).
+    rejected = client.patch(f"/v1/matches/{match_id}", json={"metadata": {"assets": [
+        {"asset_id": "steal_output", "path": str(victim), "filename": "p.mp4"},
+    ]}})
+    assert rejected.status_code == 400, rejected.text
+
+    # Paths under the storage root pass the metadata policy, so the streaming
+    # endpoint itself must pin them to this match's own folder.
+    patched = client.patch(f"/v1/matches/{match_id}", json={"metadata": {"assets": [
+        {"asset_id": "steal_other", "path": str(other_dir / "asset_x_clip.mp4"), "filename": "c.mp4"},
+        {"asset_id": "traverse", "path": str(own_dir / ".." / "match_other" / "asset_x_clip.mp4"),
+         "filename": "t.mp4"},
+        {"asset_id": "ok", "path": str(own_dir / "asset_ok_reel.mp4"), "filename": "reel.mp4"},
+    ]}})
+    assert patched.status_code == 200, patched.text
+
+    for asset_id in ("steal_other", "traverse"):
+        response = client.get(f"/v1/studio/matches/{match_id}/assets/{asset_id}/file")
+        assert response.status_code == 403, (asset_id, response.status_code, response.text)
+
+    ok = client.get(f"/v1/studio/matches/{match_id}/assets/ok/file")
+    assert ok.status_code == 200
+    assert ok.headers["content-type"].startswith("video/")

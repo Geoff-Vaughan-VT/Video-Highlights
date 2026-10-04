@@ -1128,7 +1128,21 @@ def get_match_asset_file(
     asset = next((a for a in assets if str(a.get("asset_id")) == asset_id), None)
     if not asset:
         raise HTTPException(status_code=404, detail=f"Asset not found: {asset_id}")
-    path = Path(str(asset.get("path") or ""))
+    # Only server-issued assets are streamable: uploads and exports are written
+    # by the storage backend under <local_storage_root>/<match_id>/. A path
+    # recorded in client-editable match metadata (register-local sources,
+    # PATCHed assets) must never be read back through this endpoint, or it
+    # becomes an arbitrary file read across tenants.
+    raw_path = str(asset.get("path") or "")
+    if not raw_path:
+        raise HTTPException(status_code=404, detail="Asset file is not available locally")
+    try:
+        path = Path(raw_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=404, detail="Asset file is not available locally")
+    match_storage = (Path(settings.local_storage_root).expanduser().resolve() / match_id)
+    if not _is_within(path, match_storage) or path == match_storage:
+        raise HTTPException(status_code=403, detail="Asset is not a server-managed file for this match")
     if path.suffix.lower() not in _ASSET_SUFFIXES or not path.is_file():
         raise HTTPException(status_code=404, detail="Asset file is not available locally")
     return media_response(request, path, download_name=str(asset.get("filename") or path.name))
