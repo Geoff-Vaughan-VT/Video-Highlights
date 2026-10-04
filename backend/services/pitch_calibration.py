@@ -27,14 +27,20 @@ Two ways to build one:
   touchline spans the full estimated width and the far touchline is
   ``far_line_ratio`` (default 0.85) of it, centred. This is an approximation;
   metres from an auto calibration are indicative and the UI should show the
-  confidence.
+  confidence. :func:`calibrate_auto` feeds it the union of ball extremes
+  (ball-in-net spells excluded) and player foot spread plus the centre spot
+  from kickoff rests, and then treats the length bounds as the goal lines at
+  the goal mouths, so automatically projected goal mouths land on the real
+  ones. The pitch width (touchlines) stays an estimate from where play went:
+  manual corners remain the recommended calibration.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -253,14 +259,26 @@ def calibrate_from_geometry(
     pitch_width_m: float = DEFAULT_PITCH_WIDTH_M,
     *,
     far_line_ratio: float = DEFAULT_FAR_LINE_RATIO,
+    centre_y: Optional[float] = None,
 ) -> PitchCalibration:
     """Auto calibration from ``game_tracking.FieldGeometry`` bounds.
 
-    The near touchline (``y_max``) spans ``[x_min, x_max]``; the far
+    Default: the near touchline (``y_max``) spans ``[x_min, x_max]``; the far
     touchline (``y_min``) is ``far_line_ratio`` of that length, centred - the
     trapezoid an elevated side-line camera sees. ``far_line_ratio=1.0``
     reproduces a plain rectangle (top-down camera). Confidence is 0.5 for
     player-derived bounds and 0.25 when the geometry is only a frame default.
+
+    ``centre_y`` (image y of the centre spot / of the line joining the two
+    goal mouths; also read from a ``centre_y`` attribute of
+    ``field_geometry``, as :func:`estimate_pitch_bounds` provides) switches
+    to the goal-line model: ``[x_min, x_max]`` are the goal-line positions
+    *at the goal mouths* (height ``centre_y``), which is where the ball
+    reaches the end lines, and the touchlines are placed so the centre spot
+    projects to ``centre_y`` (the far half of the pitch looks
+    ``far_line_ratio`` times shorter than the near half) while still
+    containing ``[y_min, y_max]``. The goal mouths then project exactly onto
+    the observed goal lines whatever ``far_line_ratio`` is.
     """
     if field_geometry is None:
         if frame_size is None:
@@ -272,14 +290,34 @@ def calibrate_from_geometry(
         x_min, x_max = float(field_geometry.x_min), float(field_geometry.x_max)
         y_min, y_max = float(field_geometry.y_min), float(field_geometry.y_max)
         geo_source = str(getattr(field_geometry, "source", "estimated"))
+        if centre_y is None:
+            centre_y = getattr(field_geometry, "centre_y", None)
     if x_max - x_min < 4 or y_max - y_min < 4:
         raise ValueError("field geometry is degenerate")
     ratio = float(min(1.0, max(0.3, far_line_ratio)))
     cx = (x_min + x_max) / 2.0
-    half_far = (x_max - x_min) * ratio / 2.0
-    corners = np.asarray(
-        [[cx - half_far, y_min], [cx + half_far, y_min], [x_max, y_max], [x_min, y_max]], dtype=np.float64
-    )
+    notes: Dict[str, object] = {"geometry_source": geo_source, "far_line_ratio": ratio}
+    if centre_y is not None and y_min < float(centre_y) < y_max:
+        cy = float(centre_y)
+        # Trapezoid diagonals cross at the centre spot: it sits ratio/(1+ratio)
+        # of the height below the far touchline. Grow the far half so both
+        # observed y bounds stay inside the pitch.
+        far_half = max(cy - y_min, (y_max - cy) * ratio)
+        height = far_half * (1.0 + ratio) / ratio
+        top, bottom = cy - far_half, cy - far_half + height
+        # Width at the centre-spot height equals the goal-line span.
+        frac = (cy - top) / height  # = ratio / (1 + ratio)
+        near_w = (x_max - x_min) / (ratio + (1.0 - ratio) * frac)
+        corners = np.asarray(
+            [[cx - near_w * ratio / 2.0, top], [cx + near_w * ratio / 2.0, top],
+             [cx + near_w / 2.0, bottom], [cx - near_w / 2.0, bottom]], dtype=np.float64
+        )
+        notes.update({"model": "goal_lines_at_centre_y", "centre_y": round(cy, 2)})
+    else:
+        half_far = (x_max - x_min) * ratio / 2.0
+        corners = np.asarray(
+            [[cx - half_far, y_min], [cx + half_far, y_min], [x_max, y_max], [x_min, y_max]], dtype=np.float64
+        )
     h = _homography_from_corners(corners, pitch_length_m, pitch_width_m)
     if geo_source == "frame_default":
         confidence = AUTO_DEFAULT_FRAME_CONFIDENCE
@@ -294,7 +332,7 @@ def calibrate_from_geometry(
         confidence=confidence,
         pitch_length_m=float(pitch_length_m),
         pitch_width_m=float(pitch_width_m),
-        notes={"geometry_source": geo_source, "far_line_ratio": ratio},
+        notes=notes,
     )
     LOGGER.info(
         "auto pitch calibration from %s bounds x=[%.0f, %.0f] y=[%.0f, %.0f] (far line ratio %.2f, confidence %.2f)",
@@ -334,6 +372,63 @@ class _Bounds:
     y_min: float
     y_max: float
     source: str = "estimated"
+    # Image y of the centre spot (kickoff restarts), when found. The x bounds
+    # are then goal-line positions at that height (see calibrate_from_geometry).
+    centre_y: Optional[float] = None
+    notes: Dict[str, object] = field(default_factory=dict)
+
+
+def _kth_extremes(values: np.ndarray, frac: float, min_k: int) -> Tuple[float, float]:
+    """k-th smallest / k-th largest value, ``k = max(min_k, frac * n)``.
+
+    A robust "extreme": unlike a 1 % percentile it still reaches the goal
+    line when only one or two shots got there, while one or two stray
+    samples cannot stretch it.
+    """
+    v = np.sort(np.asarray(values, dtype=np.float64))
+    k = int(min(v.size, max(int(min_k), int(round(frac * v.size)))))
+    k = max(1, k)
+    return float(v[k - 1]), float(v[v.size - k])
+
+
+def _stationary_runs(times: np.ndarray, xs: np.ndarray, ys: np.ndarray, radius: float,
+                     min_s: float, max_gap_s: float = 0.5) -> List[Tuple[int, int]]:
+    """Index ranges ``[a, b]`` where the ball stays within ``radius`` for >= ``min_s``."""
+    runs: List[Tuple[int, int]] = []
+    n = times.size
+    i = 0
+    while i < n:
+        j = i + 1
+        while (j < n and times[j] - times[j - 1] <= max_gap_s
+               and math.hypot(xs[j] - xs[i], ys[j] - ys[i]) <= radius):
+            j += 1
+        if times[j - 1] - times[i] >= min_s:
+            runs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def _trusted_goal_lines(field_geometry) -> Optional[Tuple[float, float, float]]:
+    """``(left_line_x, right_line_x, mouth_centre_y)`` from user-supplied goal boxes."""
+    if field_geometry is None:
+        return None
+    src = str(getattr(field_geometry, "source", ""))
+    if "manual" not in src:
+        return None
+    left = getattr(field_geometry, "left_goal", None)
+    right = getattr(field_geometry, "right_goal", None)
+    if left is None or right is None:
+        return None
+    try:
+        lx, rx = float(left.x2), float(right.x1)
+        cy = (float(left.y1) + float(left.y2) + float(right.y1) + float(right.y2)) / 4.0
+    except Exception:
+        return None
+    if rx - lx < 4:
+        return None
+    return lx, rx, cy
 
 
 def estimate_pitch_bounds(
@@ -343,27 +438,53 @@ def estimate_pitch_bounds(
     *,
     field_geometry=None,
     player_percentile: float = 0.5,
-    ball_percentile: float = 1.0,
+    ball_percentile: float = 0.2,
+    ball_min_extreme_samples: int = 2,
+    net_dwell_s: float = 0.5,
+    net_radius_frac: float = 0.012,
+    kickoff_spot_frac: float = 0.06,
 ) -> Optional[_Bounds]:
     """Playing-area bounds (px) from player FOOT points and the in-play ball.
 
     Player spread alone underestimates the pitch (outfield players rarely
     reach the goal lines or touchlines, especially in a short clip); the ball
-    does reach them. Bounds are the union of robust percentiles of
-    non-referee foot points, of the ball (except while it is in a net, i.e.
-    during ``goal_*`` segments) and of ``field_geometry`` when supplied.
+    does reach them. Bounds are the union of:
+
+    * robust percentiles (``player_percentile``) of non-referee foot points;
+    * robust extremes of the ball (the k-th most extreme sample,
+      ``k = max(ball_min_extreme_samples, ball_percentile % of samples)``),
+      **excluding the ball while it sits in a net**: during ``goal_*``
+      ``segments`` when given, and any stationary spell (>= ``net_dwell_s``
+      within ``net_radius_frac`` of the frame width) beyond the players'
+      x range - a ball at rest behind the end line is in the net (or
+      waiting for a goal kick), not on the pitch;
+    * ``field_geometry`` bounds (when not a frame default). When its goal
+      boxes are user-supplied (``source`` contains ``manual``) their goal
+      lines ARE the length bounds.
+
+    The ball at rest near the middle of the length (kickoffs) gives the
+    centre spot: ``centre_y`` is its median y, and the x bounds are then
+    treated as the goal lines at that height (:func:`calibrate_from_geometry`).
     """
     xs_lo, xs_hi, ys_lo, ys_hi = [], [], [], []
     feet = foot_positions(tracking)
     sources = []
+    notes: Dict[str, object] = {}
+    feet_x: Optional[Tuple[float, float]] = None
     if len(feet) >= 50:
-        xs_lo.append(np.percentile(feet[:, 1], player_percentile))
-        xs_hi.append(np.percentile(feet[:, 1], 100 - player_percentile))
+        feet_x = (float(np.percentile(feet[:, 1], player_percentile)),
+                  float(np.percentile(feet[:, 1], 100 - player_percentile)))
+        xs_lo.append(feet_x[0])
+        xs_hi.append(feet_x[1])
         ys_lo.append(np.percentile(feet[:, 2], player_percentile))
         ys_hi.append(np.percentile(feet[:, 2], 100 - player_percentile))
         sources.append("players")
+    w, h = float(tracking.frame_width), float(tracking.frame_height)
+    ball_rest: List[Tuple[float, float]] = []
     if ball_track is not None and len(ball_track) >= 50:
         bt = np.asarray(ball_track.times, dtype=np.float64)
+        bx_all = np.asarray(ball_track.xs, dtype=np.float64)
+        by_all = np.asarray(ball_track.ys, dtype=np.float64)
         keep = np.ones(bt.size, dtype=bool)
         # Drop the ball while it sits in a net (goal states). Restart states
         # are kept on purpose: they are judged against an estimated field
@@ -371,13 +492,23 @@ def estimate_pitch_bounds(
         for seg in segments or []:
             if str(getattr(seg, "state", "")).startswith("goal"):
                 keep &= ~((bt >= float(seg.start_s)) & (bt <= float(seg.end_s)))
+        runs = _stationary_runs(bt, bx_all, by_all, net_radius_frac * w, net_dwell_s)
+        dropped = 0
+        for a, b in runs:
+            rx, ry = float(np.mean(bx_all[a:b + 1])), float(np.mean(by_all[a:b + 1]))
+            ball_rest.append((rx, ry))
+            if feet_x is not None and not (feet_x[0] <= rx <= feet_x[1]):
+                keep[a:b + 1] = False
+                dropped += b - a + 1
+        notes["ball_samples_at_rest_beyond_players"] = int(dropped)
         if keep.sum() >= 50:
-            bx = np.asarray(ball_track.xs, dtype=np.float64)[keep]
-            by = np.asarray(ball_track.ys, dtype=np.float64)[keep]
-            xs_lo.append(np.percentile(bx, ball_percentile))
-            xs_hi.append(np.percentile(bx, 100 - ball_percentile))
-            ys_lo.append(np.percentile(by, ball_percentile))
-            ys_hi.append(np.percentile(by, 100 - ball_percentile))
+            bx, by = bx_all[keep], by_all[keep]
+            lo, hi = _kth_extremes(bx, ball_percentile / 100.0, ball_min_extreme_samples)
+            xs_lo.append(lo)
+            xs_hi.append(hi)
+            lo, hi = _kth_extremes(by, ball_percentile / 100.0, ball_min_extreme_samples)
+            ys_lo.append(lo)
+            ys_hi.append(hi)
             sources.append("ball")
     if field_geometry is not None and str(getattr(field_geometry, "source", "")) != "frame_default":
         xs_lo.append(float(field_geometry.x_min))
@@ -387,11 +518,27 @@ def estimate_pitch_bounds(
         sources.append("geometry")
     if not sources:
         return None
-    w, h = float(tracking.frame_width), float(tracking.frame_height)
+    x_min, x_max = float(max(0.0, min(xs_lo))), float(min(w, max(xs_hi)))
+    y_min, y_max = float(max(0.0, min(ys_lo))), float(min(h, max(ys_hi)))
+
+    centre_y: Optional[float] = None
+    goal_lines = _trusted_goal_lines(field_geometry)
+    if goal_lines is not None:
+        x_min, x_max, centre_y = goal_lines[0], goal_lines[1], goal_lines[2]
+        sources.append("goal_lines")
+    elif ball_rest:
+        cx = (x_min + x_max) / 2.0
+        spot = [ry for rx, ry in ball_rest if abs(rx - cx) <= kickoff_spot_frac * (x_max - x_min)]
+        if spot:
+            cy = float(np.median(spot))
+            # Sanity: the centre spot is well inside the observed width.
+            if y_min + 0.25 * (y_max - y_min) <= cy <= y_max - 0.25 * (y_max - y_min):
+                centre_y = cy
+                notes["centre_spot_rests"] = len(spot)
+                sources.append("centre_spot")
     return _Bounds(
-        x_min=float(max(0.0, min(xs_lo))), x_max=float(min(w, max(xs_hi))),
-        y_min=float(max(0.0, min(ys_lo))), y_max=float(min(h, max(ys_hi))),
-        source="+".join(sources),
+        x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max,
+        source="+".join(sources), centre_y=centre_y, notes=notes,
     )
 
 
@@ -406,8 +553,26 @@ def calibrate_auto(
     far_line_ratio: float = DEFAULT_FAR_LINE_RATIO,
 ) -> PitchCalibration:
     """Best automatic calibration available: :func:`estimate_pitch_bounds` +
-    :func:`calibrate_from_geometry` (falls back to the frame default)."""
+    :func:`calibrate_from_geometry` (falls back to the frame default).
+
+    What it can and cannot recover without pitch-line detection:
+
+    * the goal lines (x) at the goal mouths come from the ball's in-play
+      extremes (shots, goal kicks, corners) or user goal boxes - reliable;
+    * the centre spot (and so the goal-mouth y) comes from kickoff rests;
+    * the pitch WIDTH in pixels (touchlines) only comes from where players
+      and the ball went. In a short clip nobody reaches the touchlines, so
+      the vertical scale is underestimated (on the synthetic 20-36 s match
+      the touchlines come out ~30 % too close together) and metric y
+      distances are too large; goal mouths are then ~25 % shorter in pixels
+      than the real ones. The far-line ratio (camera tilt) is assumed.
+
+    Manual pitch corners (:func:`calibrate_from_corners`) remain the
+    recommended calibration whenever metric stats matter.
+    """
     bounds = estimate_pitch_bounds(tracking, ball_track, segments, field_geometry=field_geometry)
     calib = calibrate_from_geometry(bounds, tracking.frame_size, pitch_length_m, pitch_width_m,
                                     far_line_ratio=far_line_ratio)
+    if bounds is not None and bounds.notes:
+        calib.notes.update(bounds.notes)
     return calib

@@ -26,6 +26,7 @@ from backend.services.game_tracking import (
     estimate_field_geometry,
     overlay_set_piece_states,
 )
+from backend.services.pitch_calibration import calibrate_from_corners
 from backend.services.synthetic_match import SyntheticMatchSpec, generate_synthetic_match
 from backend.services.tracking_types import (
     TEAM_A,
@@ -58,9 +59,14 @@ def synthetic(tmp_path_factory):
     segments = analyze_game_states(ball_track, geometry, 0.0, tracking.duration_s, goal_events=goals)
     set_pieces = detect_set_pieces(ball_track, geometry, 0.0, tracking.duration_s)
     segments = overlay_set_piece_states(segments, set_pieces)
+    # Metric event thresholds (shot speed in m/s): the simulator moves the ball
+    # at realistic speeds (25 m/s shots), below the uncalibrated fallback
+    # threshold of 0.25 frame widths/s (~30 m/s on this framing).
+    x0, y0, x1, y1 = gt.pitch_bounds_px
+    calibration = calibrate_from_corners([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
     events = detect_events(
         tracking, ball_track, geometry, segments, goals, set_pieces, [],
-        team_names={0: "RED", 1: "BLUE"},
+        team_names={0: "RED", 1: "BLUE"}, calibration=calibration,
     )
     return {"gt": gt, "tracking": tracking, "ball_track": ball_track, "geometry": geometry,
             "goals": goals, "segments": segments, "events": events}

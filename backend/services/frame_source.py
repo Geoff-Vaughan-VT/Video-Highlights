@@ -630,12 +630,24 @@ def build_proxy(
 
 def proxy_result_from_file(path: Union[str, Path], *, source_size: Optional[Tuple[int, int]] = None,
                            trim_start_s: float = 0.0) -> ProxyResult:
-    """Describe an existing proxy (e.g. when reusing a previous run's proxy)."""
+    """Describe an existing proxy (e.g. when reusing a previous run's proxy).
+
+    ``audio_path`` / ``thumbs_dir`` point at the ``audio_analysis.wav`` and
+    ``thumbs/`` that :func:`build_proxy` writes next to the proxy, when they
+    exist; otherwise None. As in :func:`build_proxy`, the wav may be the
+    silent placeholder written for a source without audio: ``has_audio``
+    (from probing the proxy) says whether there is real audio.
+    """
     info = probe_video(path)
     src_w, src_h = source_size or (info.display_width, info.display_height)
+    parent = Path(path).parent
+    wav = parent / AUDIO_ANALYSIS_FILENAME
+    audio_path = str(wav) if wav.is_file() and wav.stat().st_size > 0 else None
+    thumbs = parent / THUMBS_DIRNAME
+    thumbs_dir = str(thumbs) if thumbs.is_dir() else None
     return ProxyResult(
         path=str(path), width=info.display_width, height=info.display_height, fps=info.fps,
-        scale=info.display_width / float(src_w) if src_w else 1.0, audio_path=None, thumbs_dir=None,
+        scale=info.display_width / float(src_w) if src_w else 1.0, audio_path=audio_path, thumbs_dir=thumbs_dir,
         elapsed_s=0.0, hwaccel_used=None, encoder_used=info.codec, source_width=int(src_w),
         source_height=int(src_h), duration_s=info.duration_s, frame_count=info.frame_count,
         trim_start_s=float(trim_start_s), has_audio=info.has_audio, source_info=info,

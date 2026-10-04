@@ -21,6 +21,7 @@ from backend.services.tracking_engine import (
     legacy_track_video_tuple,
     legacy_views,
     make_tracker,
+    select_focus,
     torso_histogram,
     track_video,
 )
@@ -181,6 +182,34 @@ def test_focus_track_id_passthrough_and_fallback(match, tracked) -> None:
     fallback = track_video(match["proxy"], detector=_detector(match), focus_roi=far_roi)
     assert fallback.focus_track_id == fallback.longest_track_id()
     assert fallback.detector["focus_selection"]["method"] == "fallback_longest"
+
+
+def test_select_focus_retargets_loaded_tracks(tmp_path: Path, match) -> None:
+    """Public wrapper used by the pipeline when tracks are reused (no re-detection)."""
+    import backend.services.tracking_engine as te
+
+    truth = match["truth"].tracking
+    truth.save(tmp_path)
+    loaded = TrackingResult.load(tmp_path)
+    assert te._select_focus is not None  # the private name stays available
+
+    sel = select_focus(loaded, focus_track_id=3)
+    assert sel == {"method": "track_id", "requested": 3, "track_id": 3}
+    assert loaded.focus_track_id == 3
+
+    box = truth.players[6].box_at(1.0)
+    roi = {"x1_norm": (box[0] - 4) / 1280, "y1_norm": (box[1] - 4) / 720,
+           "x2_norm": (box[2] + 4) / 1280, "y2_norm": (box[3] + 4) / 720, "t": 1.0}
+    sel = select_focus(loaded, focus_roi=roi)
+    assert sel["method"] == "roi" and loaded.focus_track_id == 6
+
+    # Unknown id without an ROI: no focus; unknown id with a far ROI: longest track.
+    assert select_focus(loaded, focus_track_id=999) == {"method": "none"}
+    assert loaded.focus_track_id is None
+    far = {"x1_norm": 0.0, "y1_norm": 0.0, "x2_norm": 0.02, "y2_norm": 0.02}
+    sel = select_focus(loaded, focus_track_id=999, focus_roi=far)
+    assert sel["method"] == "fallback_longest" and loaded.focus_track_id == loaded.longest_track_id()
+    assert select_focus(loaded) == {"method": "none"}
 
 
 # ----------------------------------------------------------------------

@@ -458,6 +458,20 @@ def _goal_box_from_override(raw: Optional[Dict[str, object]], side: str,
     return GoalBox(side=side, x1=min(x1, x2), y1=min(y1, y2), x2=max(x1, x2), y2=max(y1, y2))
 
 
+# Real goal: 7.32 m between the posts on a 68 m wide pitch (10.8 %).
+GOAL_MOUTH_HALF_M = 3.66
+# Uncalibrated goal mouth height as a fraction of the estimated field height
+# (7.32 m / 68 m, rounded up a little for the estimate's uncertainty).
+DEFAULT_GOAL_MOUTH_FRAC = 0.11
+# Uncalibrated goal box depth behind the line (fraction of field width): the
+# estimated goal line itself is uncertain by a few metres, so the box is
+# deeper than a real net.
+DEFAULT_GOAL_DEPTH_FRAC = 0.05
+# Calibrated goal boxes: tolerance beyond each post and depth behind the line.
+DEFAULT_GOAL_MARGIN_M = 1.0
+DEFAULT_GOAL_DEPTH_M = 2.5
+
+
 def estimate_field_geometry(
     player_positions: Optional[np.ndarray],
     frame_size: Tuple[int, int],
@@ -466,19 +480,33 @@ def estimate_field_geometry(
     *,
     field_bounds: Optional[Sequence[float]] = None,
     calibration: object = None,
+    goal_mouth_frac: float = DEFAULT_GOAL_MOUTH_FRAC,
+    goal_depth_frac: float = DEFAULT_GOAL_DEPTH_FRAC,
+    goal_margin_m: float = DEFAULT_GOAL_MARGIN_M,
+    goal_depth_m: float = DEFAULT_GOAL_DEPTH_M,
 ) -> FieldGeometry:
     """Estimate the playable area and goal mouths from player positions.
 
     Player positions accumulated over a match trace out the field: robust
     percentiles of x/y give the field bounds, and the vertical position of
     players close to each end line (mostly the goalkeepers) centers the goal
-    mouth. Manual goal boxes (pixel or normalized) override the estimate.
+    mouth. Manual goal boxes (pixel or normalized) override everything.
 
     ``field_bounds`` ``(x_min, y_min, x_max, y_max)`` (pixels) or a
     ``pitch_calibration.PitchCalibration`` (its ``image_corners_px``) pin the
     field rectangle exactly instead of estimating it from players, who rarely
-    reach the lines. With a calibration the goal mouths are projected from the
-    real 7.32 m goal width.
+    reach the lines.
+
+    Goal boxes (the area the ball must reach to count as "in the goal"):
+
+    * with a ``calibration`` (duck-typed: ``to_image(points_m)`` and
+      ``pitch_length_m``): the real goal mouth (posts at +/-3.66 m on the
+      goal line ``x = +/-length/2``) widened by ``goal_margin_m`` beyond each
+      post, and ``goal_depth_m`` deep behind the line, projected to pixels.
+      The goal line x is the projected line between the posts.
+    * without: ``goal_mouth_frac`` (default 0.11 = 7.32 m / 68 m) of the field
+      height, centred on the estimated goal-line y, ``goal_depth_frac`` of the
+      field width deep.
     """
     w, h = int(frame_size[0]), int(frame_size[1])
     positions = None
@@ -526,27 +554,32 @@ def estimate_field_geometry(
             return (y_min + y_max) / 2.0
         return float(np.median(band[:, 2]))
 
-    goal_h = max(40.0, field_h * 0.30)
-    goal_depth = max(24.0, field_w * 0.05)
+    goal_h = max(16.0, field_h * float(goal_mouth_frac))
+    goal_depth = max(16.0, field_w * float(goal_depth_frac))
 
     def _calibrated_goal(side: str) -> Optional[GoalBox]:
         if calibration is None or not hasattr(calibration, "to_image"):
             return None
         try:
             half_l = float(getattr(calibration, "pitch_length_m", 105.0)) / 2.0
-            sx = -half_l if side == "left" else half_l
-            # Posts at +/-3.66 m; widen by the crossbar's apparent height
-            # (2.44 m) upward in the image, approximated with 2.5 m of width.
-            pts = np.asarray(calibration.to_image(np.array([[sx, -3.66 - 2.5], [sx, 3.66]])), dtype=np.float64)
-            if not np.all(np.isfinite(pts)):
+            line_m = -half_l if side == "left" else half_l
+            back_m = line_m + (-1.0 if side == "left" else 1.0) * max(0.0, float(goal_depth_m))
+            half_mouth = GOAL_MOUTH_HALF_M + max(0.0, float(goal_margin_m))
+            # Posts (+margin) on the goal line, then the back of the box.
+            pts_m = np.array([[line_m, -half_mouth], [line_m, half_mouth],
+                              [back_m, -half_mouth], [back_m, half_mouth]])
+            pts = np.asarray(calibration.to_image(pts_m), dtype=np.float64).reshape(-1, 2)
+            if pts.shape[0] != 4 or not np.all(np.isfinite(pts)):
                 return None
-            gx = float(np.mean(pts[:, 0]))
+            line_x = float(np.mean(pts[:2, 0]))
+            back_x = float(np.mean(pts[2:, 0]))
             y1, y2 = float(pts[:, 1].min()), float(pts[:, 1].max())
             if y2 - y1 < 4.0:
                 return None
+            depth = max(4.0, abs(back_x - line_x))
             if side == "left":
-                return GoalBox(side="left", x1=max(0.0, gx - goal_depth), y1=y1, x2=gx, y2=y2)
-            return GoalBox(side="right", x1=gx, y1=y1, x2=min(float(w), gx + goal_depth), y2=y2)
+                return GoalBox(side="left", x1=max(0.0, line_x - depth), y1=y1, x2=line_x, y2=y2)
+            return GoalBox(side="right", x1=line_x, y1=y1, x2=min(float(w), line_x + depth), y2=y2)
         except Exception:
             return None
 
@@ -645,13 +678,21 @@ class GameStateConfig:
     goal_extrapolation_s: float = 0.8
     # Consecutive in-goal sightings further apart than this start a new run.
     goal_run_gap_s: float = 1.5
-    # Weak band around the posts (max of these two). Inside the posts is a
-    # "strong" location; inside this band only "weak".
+    # Weak band around the posts (max of these two, the fraction is of the
+    # goal box height). Inside the goal box is a "strong" location; inside
+    # this band only "weak". Calibrated boxes already include ~1 m beyond
+    # each post, so the band stays small.
     goal_mouth_margin_px: float = 6.0
     goal_mouth_margin_frac: float = 0.06
-    # When the goal boxes are only ESTIMATED from player positions, only the
-    # central fraction of the box counts as "between the posts" (strong).
-    estimated_goal_strict_frac: float = 0.6
+    # When the goal boxes are only ESTIMATED from player positions (a real
+    # 7.32 m mouth, ~11 % of the field height, centred on the goalkeepers'
+    # median y), the central ``estimated_goal_strict_frac`` of the box counts
+    # as "between the posts" (strong) and the weak band extends
+    # ``estimated_goal_margin_frac`` box heights beyond each post to absorb
+    # the uncertainty of the estimated centre (strong 11 %, weak 22 % of the
+    # field height; the old 30 %-tall estimate gave 18 % / 34 %).
+    estimated_goal_strict_frac: float = 1.0
+    estimated_goal_margin_frac: float = 0.5
     # Ball arrested by the net: at least this long / many samples inside the
     # goal box with a low median speed.
     goal_dwell_min_s: float = 0.3
@@ -920,11 +961,13 @@ def detect_goal_candidates(
     def _bands(goal: GoalBox) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         h = abs(goal.y2 - goal.y1)
         if estimated:
-            shrink = (1.0 - cfg.estimated_goal_strict_frac) / 2.0 * h
+            shrink = (1.0 - min(1.0, cfg.estimated_goal_strict_frac)) / 2.0 * h
             strict = (goal.y1 + shrink, goal.y2 - shrink)
+            margin_frac = max(cfg.goal_mouth_margin_frac, cfg.estimated_goal_margin_frac)
         else:
             strict = (goal.y1, goal.y2)
-        margin = max(cfg.goal_mouth_margin_px, h * cfg.goal_mouth_margin_frac)
+            margin_frac = cfg.goal_mouth_margin_frac
+        margin = max(cfg.goal_mouth_margin_px, h * margin_frac)
         return strict, (goal.y1 - margin, goal.y2 + margin)
 
     def _band(y: float, goal: GoalBox) -> Optional[str]:

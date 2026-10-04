@@ -1022,6 +1022,35 @@ def _build_result(
     return result, stats
 
 
+def select_focus(
+    result: TrackingResult,
+    *,
+    focus_roi: Optional[Mapping[str, object]] = None,
+    focus_track_id: Optional[int] = None,
+    stride: Optional[int] = None,
+) -> Dict[str, object]:
+    """Choose the focus player of a (fresh or loaded) :class:`TrackingResult`.
+
+    Sets ``result.focus_track_id`` in place and returns how it was chosen as
+    ``{"method": ..., "track_id": ...}`` (plus details per method):
+
+    * ``focus_track_id`` given: that identity (``"track_id"``), or the
+      stitched identity whose ``source_track_ids`` contain it
+      (``"track_id_stitched"``). An unknown id falls through to the ROI.
+    * ``focus_roi`` given (``x1_norm``/``y1_norm``/... or pixel box, plus
+      optional ``t``/``time_s``): the track under the box at that time
+      (``"roi"``), else the longest track (``"fallback_longest"``).
+    * neither: no focus (``"none"``, ``focus_track_id`` reset to None).
+
+    ``stride`` (frames between processed samples) defaults to the result's
+    ``vid_stride``; it only widens the ROI matching window. Use this to
+    re-target the focus player on reused tracks without re-detecting.
+    """
+    if stride is None:
+        stride = int(getattr(result, "vid_stride", 1) or 1)
+    return _select_focus(result, focus_roi=focus_roi, focus_track_id=focus_track_id, stride=max(1, int(stride)))
+
+
 def _select_focus(
     result: TrackingResult,
     *,

@@ -161,6 +161,20 @@ def test_proxy_result_from_file(media) -> None:
     assert reuse.scale == pytest.approx(0.5)
     assert reuse.fps == pytest.approx(25.0)
     assert reuse.frame_count == 100
+    # The analysis wav and thumbnails written next to the proxy are found again.
+    assert reuse.has_audio
+    assert reuse.audio_path == media["proxy"].audio_path
+    assert Path(reuse.audio_path).name == "audio_analysis.wav"
+    assert reuse.thumbs_dir == media["proxy"].thumbs_dir
+    assert Path(reuse.thumbs_dir).is_dir()
+
+
+def test_proxy_result_from_file_without_sidecars(tmp_path: Path, media) -> None:
+    lone = tmp_path / "proxy_copy.mp4"
+    shutil.copyfile(media["proxy"].path, lone)
+    reuse = proxy_result_from_file(lone, source_size=(1280, 720))
+    assert reuse.audio_path is None
+    assert reuse.thumbs_dir is None
 
 
 # ----------------------------------------------------------------------
