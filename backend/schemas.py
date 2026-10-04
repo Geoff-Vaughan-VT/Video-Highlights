@@ -921,8 +921,10 @@ class NotificationRead(BaseModel):
 
 
 class UploadPolicyRead(BaseModel):
+    # max_upload_bytes / max_upload_gb of 0 mean "no limit" (the default).
     max_upload_bytes: int
     max_upload_gb: float
+    unlimited: bool = False
     extended_max_upload_bytes: int
     extended_max_upload_gb: float
     extended_upload_enabled: bool = False

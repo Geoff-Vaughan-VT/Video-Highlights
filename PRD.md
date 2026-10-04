@@ -52,8 +52,8 @@ Enable coaches and families to upload full soccer match recordings and receive s
 - `FR-INGEST-02`: Support resumable uploads and durable storage.
 - `FR-INGEST-03`: Run processing asynchronously with stage-level progress.
 - `FR-INGEST-04`: Persist job metadata, artifacts, and retry history.
-- `FR-INGEST-05`: Support drag-and-drop upload of MP4 match files up to a standard size limit (3 GB baseline).
-- `FR-INGEST-06`: Support oversize uploads (up to 8 GB) as a paid add-on, with entitlement checks enforced at upload time.
+- `FR-INGEST-05`: Support drag-and-drop upload of MP4 match files with no size limit by default; full 4K matches are 15-25 GB. An optional cap (`VH_UPLOAD_MAX_GB`) exists for hosted/metered plans only.
+- `FR-INGEST-06`: Where a hosted plan sets a cap, support a higher entitlement-gated cap (`VH_UPLOAD_EXTENDED_MAX_GB`) enforced at upload time.
 - `FR-INGEST-07`: Enforce a minimum match length (30 minutes) with clear pre-upload validation messaging.
 - `FR-INGEST-08`: Accept video filmed on mobile devices (iOS and Android), handling common codecs, frame rates, and orientations.
 

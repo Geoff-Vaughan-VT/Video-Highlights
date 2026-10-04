@@ -24,6 +24,8 @@ def test_upload_policy_endpoint(client: TestClient) -> None:
     assert response.status_code == 200, response.text
     policy = response.json()
     assert policy["max_upload_gb"] == settings.upload_max_gb
+    assert policy["max_upload_bytes"] == 0
+    assert policy["unlimited"] is True
     assert policy["extended_upload_enabled"] is False
     assert policy["extended_max_upload_gb"] == settings.upload_extended_max_gb
     assert ".mp4" in policy["allowed_extensions"]
@@ -55,7 +57,8 @@ def test_upload_rejects_oversize_file(client: TestClient) -> None:
         assert response.status_code == 413
         message = response.json()["error"]["message"]
         assert "upload limit" in message
-        assert "paid add-on" in message
+        assert "VH_UPLOAD_MAX_GB" in message
+        assert "paid" not in message
     finally:
         settings.upload_max_gb = original
 

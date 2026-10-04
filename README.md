@@ -290,8 +290,8 @@ and provides:
 Upload/notification behavior is configured by environment:
 
 ```bash
-VH_UPLOAD_MAX_GB=3                  # standard upload cap
-VH_UPLOAD_EXTENDED_MAX_GB=8         # cap for tenants with the extended_uploads entitlement
+VH_UPLOAD_MAX_GB=0                  # upload size cap in GB; 0 = no limit (default, self-hosted)
+VH_UPLOAD_EXTENDED_MAX_GB=0         # optional higher cap for tenants with the extended_uploads entitlement
 VH_UPLOAD_MIN_DURATION_SECONDS=0    # set 1800 to enforce the 30-minute match minimum
 VH_PROCESSING_SLA_HOURS_MIN=4       # turnaround target shown in the UI
 VH_PROCESSING_SLA_HOURS_MAX=6

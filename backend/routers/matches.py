@@ -51,10 +51,22 @@ def _tenant_has_extended_uploads(session: Session, tenant_id: str | None) -> boo
     return bool(entitlements.get("extended_uploads", False))
 
 
+def _effective_cap_gb(extended: bool) -> float:
+    """Upload cap in GB for this tenant; 0 means unlimited.
+
+    Tenants with the extended entitlement use the extended cap (0 = no limit,
+    which is the default); everyone else uses the standard cap (also 0 by
+    default). Caps only exist for hosted/metered deployments.
+    """
+    if extended:
+        return max(0.0, float(settings.upload_extended_max_gb or 0.0))
+    return max(0.0, float(settings.upload_max_gb or 0.0))
+
+
 def _resolve_upload_cap_bytes(session: Session, tenant_id: str | None) -> tuple[int, bool]:
+    """Return (cap_bytes, extended); cap_bytes == 0 means no limit."""
     extended = _tenant_has_extended_uploads(session, tenant_id)
-    cap_gb = settings.upload_extended_max_gb if extended else settings.upload_max_gb
-    return _gb_to_bytes(cap_gb), extended
+    return _gb_to_bytes(_effective_cap_gb(extended)), extended
 
 
 def _run_ffprobe(path: str) -> Dict[str, Any]:
@@ -284,7 +296,8 @@ def get_upload_policy(
     cap_bytes, extended = _resolve_upload_cap_bytes(session, tenant.tenant_id)
     return UploadPolicyRead(
         max_upload_bytes=cap_bytes,
-        max_upload_gb=settings.upload_extended_max_gb if extended else settings.upload_max_gb,
+        max_upload_gb=_effective_cap_gb(extended),
+        unlimited=cap_bytes <= 0,
         extended_max_upload_bytes=_gb_to_bytes(settings.upload_extended_max_gb),
         extended_max_upload_gb=settings.upload_extended_max_gb,
         extended_upload_enabled=extended,
@@ -439,13 +452,15 @@ def upload_match_asset(
         _discard_stored(stored)
         raise HTTPException(status_code=400, detail="Uploaded video file is empty. Choose a non-empty MP4/MOV/MKV/AVI file.")
 
-    if int(stored.size_bytes or 0) > cap_bytes:
+    if cap_bytes > 0 and int(stored.size_bytes or 0) > cap_bytes:
         _discard_stored(stored)
-        cap_gb = settings.upload_extended_max_gb if extended else settings.upload_max_gb
-        upgrade_hint = "" if extended else " Larger matches are available as a paid add-on (extended uploads)."
+        cap_gb = _effective_cap_gb(extended)
         raise HTTPException(
             status_code=413,
-            detail=f"Video is larger than the {cap_gb:g} GB upload limit for this account.{upgrade_hint}",
+            detail=(
+                f"Video is larger than the {cap_gb:g} GB upload limit configured for this server "
+                "(VH_UPLOAD_MAX_GB). Register the file as a local path instead, or raise the limit."
+            ),
         )
 
     probe: Dict[str, Any] = {}
