@@ -37,7 +37,24 @@ export const post = (path, body) =>
   api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 export const patch = (path, body) =>
   api(path, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+export const put = (path, body) =>
+  api(path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 export const del = (path) => api(path, { method: 'DELETE' });
+
+// Run artifacts are served header-less (so <video>/<img> can use them).
+export const runFileUrl = (runId, name) =>
+  `${API}/studio/runs/${encodeURIComponent(runId)}/file/${encodeURIComponent(name)}`;
+export const runThumbUrl = (runId, name) =>
+  `${API}/studio/runs/${encodeURIComponent(runId)}/thumb/${encodeURIComponent(name)}`;
+export const runPosterUrl = (runId) => `${API}/studio/runs/${encodeURIComponent(runId)}/poster`;
+
+// Tenant-scoped media (exported reels, on-demand clips) needs auth headers,
+// so fetch it and hand the element an object URL. Caller revokes it.
+export async function authedBlobUrl(path) {
+  const response = await fetch(`${API}${path}`, { headers: authHeaders() });
+  if (!response.ok) throw await parseError(response);
+  return URL.createObjectURL(await response.blob());
+}
 
 // Resolve the signed-in identity and remember the tenant the server picked,
 // so later requests are explicit even when the user has several memberships.

@@ -3,10 +3,11 @@
 // customer sends them a link.
 
 import { API } from '../api.js';
-import { esc, fmtMs, setMain } from '../ui.js';
+import { icon } from '../icons.js';
+import { emptyState, esc, fmtDay, fmtMs, setMain, skLines } from '../ui.js';
 
 export async function renderShare(token) {
-  setMain('<div class="empty">Loading shared match…</div>');
+  setMain(`<div class="page" style="padding-top:24px"><div class="panel">${skLines(5)}</div></div>`);
   let payload;
   try {
     // Deliberately a bare fetch: no auth or tenant headers on a public link.
@@ -17,74 +18,62 @@ export async function renderShare(token) {
     }
     payload = await response.json();
   } catch (error) {
-    setMain(`<div class="empty">${esc(error.message)}</div>`);
+    setMain(`<div class="page" style="padding-top:48px">${emptyState('link', 'Link unavailable', esc(error.message))}</div>`);
     return;
   }
 
   const match = payload.match || {};
-  const header = `
-    <h1>${esc(match.name || 'Shared match')}</h1>
-    <div class="sub">${esc(match.home_team_name || 'Home')} vs ${esc(match.away_team_name || 'Away')}
-      ${match.match_date ? ' · ' + esc(match.match_date) : ''}
-      ${payload.label ? ' · ' + esc(payload.label) : ''}</div>`;
+  const header = `<div class="pagehead" style="margin-top:16px"><div><div class="eyebrow">Shared match</div>
+      <h1>${esc(match.name || 'Shared match')}</h1>
+      <div class="sub">${esc(match.home_team_name || 'Home')} vs ${esc(match.away_team_name || 'Away')}${match.match_date ? ` · ${esc(fmtDay(match.match_date))}` : ''}${payload.label ? ` · ${esc(payload.label)}` : ''}</div></div></div>`;
+  const footer = '<div class="note" style="text-align:center;margin-top:32px">Shared from Video Highlights Studio · <a href="#matches">Sign in</a></div>';
 
-  if (payload.scope === 'highlight') return setMain(header + highlightPanel(payload.highlight));
-  if (payload.scope === 'player_card') return setMain(header + playerCardPanel(payload.player_card));
+  if (payload.scope === 'highlight') return setMain(`<div class="page">${header}${highlightPanel(payload.highlight)}${footer}</div>`);
+  if (payload.scope === 'player_card') return setMain(`<div class="page">${header}${playerCardPanel(payload.player_card)}${footer}</div>`);
 
-  setMain(`${header}
-    <div class="panel"><h3>Team stats</h3>
+  setMain(`<div class="page">${header}
+    <div class="panel"><div class="panel-title">Team stats</div>
       <div class="statgrid">${(payload.stats || []).map(shareStatTile).join('')}</div>
-      <div class="note">Stats shown as “–” could not be measured from this footage${
-        payload.analysis?.source_label ? ` (source: ${esc(payload.analysis.source_label)})` : ''}.</div>
-    </div>
-    <div class="panel"><h3>Highlights</h3>
+      <div class="note">Stats shown as “–” could not be measured from this footage${payload.analysis?.source_label ? ` (source: ${esc(payload.analysis.source_label)})` : ''}.</div></div>
+    <div class="panel"><div class="panel-title">Highlights</div>
       ${(payload.highlights || []).length ? `<div class="tablewrap"><table>
-        <thead><tr><th>at</th><th>type</th><th>player</th></tr></thead>
-        <tbody>${payload.highlights.map((item) => `
-          <tr><td>${fmtMs(item.occurred_at_ms)}</td><td>${esc(item.event_type)}</td>
+        <thead><tr><th>Time</th><th>Type</th><th>Player</th></tr></thead>
+        <tbody>${payload.highlights.map((item) => `<tr><td class="num">${fmtMs(item.occurred_at_ms)}</td><td>${esc(item.event_type.replace(/_/g, ' '))}</td>
           <td>${item.player_name ? `#${esc(item.jersey_number || '')} ${esc(item.player_name)}` : '—'}</td></tr>`).join('')}
-        </tbody></table></div>` : '<div class="note">No highlights yet.</div>'}
-    </div>
-    <div class="note">Shared from Video Highlights Studio · <a href="#matches">Sign in</a></div>`);
+        </tbody></table></div>` : '<div class="note">No highlights yet.</div>'}</div>${footer}</div>`);
 }
 
 function shareStatTile(stat) {
-  const fmt = (value) => value == null ? '–' : (stat.unit === 'percent' ? `${value}%` : `${value}`);
+  const fmt = (value) => (value == null ? '–' : (stat.unit === 'percent' ? `${value}%` : `${value}`));
   if (!stat.available) {
-    return `<div class="stat na"><div class="k">${esc(stat.label)}</div>
-      <div class="vals"><span>–</span><span class="mid">|</span><span>–</span></div></div>`;
+    return `<div class="stat na"><div class="k">${esc(stat.label)}</div><div class="vals"><span>–</span><span class="mid">|</span><span>–</span></div></div>`;
   }
   return `<div class="stat"><div class="k">${esc(stat.label)}</div>
     <div class="vals"><span>${fmt(stat.home)}</span><span class="mid">home · away</span><span>${fmt(stat.away)}</span></div></div>`;
 }
 
 function highlightPanel(highlight) {
-  if (!highlight) return '<div class="empty">Highlight unavailable.</div>';
-  return `<div class="panel"><h3>Highlight</h3>
+  if (!highlight) return emptyState('film', 'Highlight unavailable');
+  return `<div class="panel"><div class="panel-title">${icon('film', 'sm')} Highlight</div>
     <div class="metrics">
-      <div class="metric"><div class="v">${esc(highlight.event_type)}</div><div class="l">Type</div></div>
+      <div class="metric"><div class="v">${esc(highlight.event_type.replace(/_/g, ' '))}</div><div class="l">Type</div></div>
       <div class="metric"><div class="v">${fmtMs(highlight.occurred_at_ms)}</div><div class="l">Match time</div></div>
-      <div class="metric"><div class="v">${(+highlight.confidence || 0).toFixed(2)}</div><div class="l">Confidence</div></div>
+      <div class="metric"><div class="v">${Math.round((+highlight.confidence || 0) * 100)}%</div><div class="l">Confidence</div></div>
     </div>
-    ${highlight.player_name ? `<div class="note">Attributed to #${esc(highlight.jersey_number || '')} ${esc(highlight.player_name)}</div>` : ''}
-  </div>`;
+    ${highlight.player_name ? `<div class="note">Attributed to #${esc(highlight.jersey_number || '')} ${esc(highlight.player_name)}</div>` : ''}</div>`;
 }
 
 function playerCardPanel(card) {
-  if (!card) return '<div class="empty">Player card unavailable.</div>';
-  return `<div class="panel"><h3>Player card</h3>
-    <div style="font-size:18px;font-weight:700;margin-bottom:4px">#${esc(card.jersey_number)} ${esc(card.player_name)}</div>
-    <div class="note" style="margin:0 0 12px">${esc(card.position || '')}${card.team_name ? ' · ' + esc(card.team_name) : ''}</div>
+  if (!card) return emptyState('card', 'Player card unavailable');
+  return `<div class="panel"><div class="pcard-head" style="margin-bottom:16px"><div class="jersey" style="--c:var(--accent);color:var(--accent-ink)">${esc(card.jersey_number)}</div>
+      <div><h3>${esc(card.player_name)}</h3><div class="faint xs">${esc(card.position || '')}${card.team_name ? ` · ${esc(card.team_name)}` : ''}</div></div></div>
     <div class="metrics">
       <div class="metric"><div class="v">${card.highlight_count}</div><div class="l">Highlights</div></div>
-      ${(card.stats || []).slice(0, 2).map((stat) =>
-        `<div class="metric"><div class="v">${stat.count}</div><div class="l">${esc(stat.label)}</div></div>`).join('')}
+      ${(card.stats || []).slice(0, 2).map((stat) => `<div class="metric"><div class="v">${stat.count}</div><div class="l">${esc(stat.label)}</div></div>`).join('')}
     </div>
     ${(card.highlights || []).length ? `<div class="tablewrap"><table>
-      <thead><tr><th>at</th><th>type</th><th>conf</th></tr></thead>
-      <tbody>${card.highlights.map((item) => `
-        <tr><td>${fmtMs(item.occurred_at_ms)}</td><td>${esc(item.event_type)}</td>
-        <td>${(+item.confidence || 0).toFixed(2)}</td></tr>`).join('')}
-      </tbody></table></div>` : '<div class="note">No highlights attributed yet.</div>'}
-  </div>`;
+      <thead><tr><th>Time</th><th>Type</th><th class="r">Confidence</th></tr></thead>
+      <tbody>${card.highlights.map((item) => `<tr><td class="num">${fmtMs(item.occurred_at_ms)}</td><td>${esc(item.event_type.replace(/_/g, ' '))}</td>
+        <td class="r">${Math.round((+item.confidence || 0) * 100)}%</td></tr>`).join('')}
+      </tbody></table></div>` : '<div class="note">No highlights attributed yet.</div>'}</div>`;
 }
