@@ -121,7 +121,8 @@ function bindNav(onNext) {
 
 function stepVideo() {
   const policy = st.policy;
-  const maxLabel = policy ? `${policy.max_upload_gb} GB` : '3 GB';
+  const limited = !!(policy && policy.max_upload_bytes > 0);
+  const maxLabel = limited ? `up to ${policy.max_upload_gb} GB` : 'no size limit';
   const extensions = (policy?.allowed_extensions || ['.mp4', '.mov', '.mkv', '.avi', '.m4v']).join(', ');
   const linkProviders = (st.sources || []).filter((source) => source.kind === 'link' && source.key !== 'other_link');
   $('#wizard').innerHTML = `
@@ -138,7 +139,7 @@ function stepVideo() {
       <div id="m_upload">
         <div class="dropzone" id="drop" tabindex="0" role="button" aria-label="Choose a video file">
           ${icon('upload', 'lg')}<div class="big">Drop the match video here, or click to browse</div>
-          <div class="small">${esc(extensions)} · up to ${esc(maxLabel)}${policy && !policy.extended_upload_enabled ? ' (larger uploads available as an add-on)' : ''}</div></div>
+          <div class="small">${esc(extensions)} · ${esc(maxLabel)}</div></div>
         <input type="file" id="c_file" accept="video/*" hidden>
         <div class="filemeta" id="filemeta"></div><div id="filenotes"></div></div>
       <div id="m_local" hidden>
@@ -225,8 +226,8 @@ function stepVideo() {
     const ext = `.${(file.name.split('.').pop() || '').toLowerCase()}`;
     const allowed = policy?.allowed_extensions || ['.mp4', '.mov', '.mkv', '.avi', '.m4v'];
     if (!allowed.includes(ext)) { meta.errors.push(`'${ext}' is not a supported video format (${allowed.join(', ')}).`); meta.blocked = true; }
-    if (policy && file.size > policy.max_upload_bytes) {
-      meta.errors.push(`File is ${fmtBytes(file.size)} — over the ${policy.max_upload_gb} GB limit for this account.${policy.extended_upload_enabled ? '' : ' Larger uploads are available as a paid add-on.'}`);
+    if (policy && policy.max_upload_bytes > 0 && file.size > policy.max_upload_bytes) {
+      meta.errors.push(`File is ${fmtBytes(file.size)}, over the ${policy.max_upload_gb} GB limit configured for this server. Register it as a local path instead, or raise VH_UPLOAD_MAX_GB.`);
       meta.blocked = true;
     }
     await probe(file, meta);

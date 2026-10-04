@@ -45,8 +45,10 @@ class Settings:
     persist_job_logs: bool = os.getenv("VH_PERSIST_JOB_LOGS", "true").lower() in {"1", "true", "yes"}
     # Upload policy (FR-INGEST-05..07): standard cap, entitlement-gated extended cap,
     # and an optional minimum-duration gate (0 disables; set 1800 for the 30-minute product rule).
-    upload_max_gb: float = float(os.getenv("VH_UPLOAD_MAX_GB", "3"))
-    upload_extended_max_gb: float = float(os.getenv("VH_UPLOAD_EXTENDED_MAX_GB", "8"))
+    # 0 = no size limit (the default for a self-hosted install processing full
+    # 4K matches). Set a cap only for a hosted/metered deployment.
+    upload_max_gb: float = float(os.getenv("VH_UPLOAD_MAX_GB", "0"))
+    upload_extended_max_gb: float = float(os.getenv("VH_UPLOAD_EXTENDED_MAX_GB", "0"))
     upload_min_duration_seconds: float = float(os.getenv("VH_UPLOAD_MIN_DURATION_SECONDS", "0"))
     # Customer-facing processing turnaround target (NFR-SLA-01), surfaced in the UI.
     processing_sla_hours_min: int = int(os.getenv("VH_PROCESSING_SLA_HOURS_MIN", "4"))
