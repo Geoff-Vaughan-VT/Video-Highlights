@@ -129,3 +129,125 @@ def test_detect_team_colors_needs_enough_signal(tmp_path) -> None:
     assert detect_team_colors(str(video), None) is None
     few = np.asarray([(0.5, 120.0, 150.0)] * 10, dtype=np.float64)
     assert detect_team_colors(str(video), few) is None
+
+
+# ---------------------------------------------------------------------------
+# Legacy cap regression + v2 per-track labelling
+# ---------------------------------------------------------------------------
+
+import copy  # noqa: E402
+
+from backend.services.synthetic_match import SyntheticMatchSpec, generate_synthetic_match  # noqa: E402
+from backend.services.team_classification import (  # noqa: E402
+    TeamClassifierConfig,
+    assign_track_teams,
+    assign_track_teams_with_report,
+)
+from backend.services.tracking_types import TEAM_REFEREE, TEAM_UNKNOWN, PlayerTrack  # noqa: E402
+
+
+def test_classify_player_teams_covers_whole_window_despite_row_cap(tmp_path) -> None:
+    """The old 4000-row cap stopped labelling after the first minutes."""
+    video = tmp_path / "long.mp4"
+    positions = _write_two_team_video(video, frames=120)  # 12 s
+    cfg = TeamClassifierConfig(max_samples=10, sample_fps=1.0)
+    labeled = classify_player_teams(str(video), positions, RED, BLUE, config=cfg)
+    assert len(labeled) > 10
+    assert float(labeled[:, 0].max()) > 10.0, "labelling stopped early"
+    known = labeled[labeled[:, 3] >= 0]
+    assert np.mean(known[known[:, 1] < W / 2, 3] == 0) > 0.9
+
+
+@pytest.fixture(scope="module")
+def synthetic_kits(tmp_path_factory):
+    path = tmp_path_factory.mktemp("kits") / "match.mp4"
+    gt = generate_synthetic_match(path, SyntheticMatchSpec(duration_s=12.0))
+    return path, gt
+
+
+def _unlabelled(tracking):
+    tr = copy.deepcopy(tracking)
+    for p in tr.players.values():
+        p.team = TEAM_UNKNOWN
+        p.team_confidence = 0.0
+    return tr
+
+
+def _accuracy(tr, truth) -> float:
+    return float(np.mean([tr.players[k].team == truth[k] for k in truth]))
+
+
+# Synthetic kits: team A red (BGR 40,40,220), team B cyan (BGR 220,200,40), referee near-black.
+RED_KIT = TeamConfig(name="Reds", color_hex="#dc2828")
+CYAN_KIT = TeamConfig(name="Cyans", color_hex="#28c8dc")
+
+
+def test_assign_track_teams_without_colours(synthetic_kits) -> None:
+    path, gt = synthetic_kits
+    truth = {k: p.team for k, p in gt.tracking.players.items()}
+    tr, report = assign_track_teams_with_report(str(path), _unlabelled(gt.tracking), sample_hz=1.0)
+    # Clusters are named by population: both teams have 5 players, so check
+    # the partition (allowing a label swap) and the referee.
+    acc = max(_accuracy(tr, truth), _accuracy(_swap_teams(tr), truth))
+    assert acc >= 0.9
+    referee_ids = [k for k, v in truth.items() if v == TEAM_REFEREE]
+    assert all(tr.players[k].team == TEAM_REFEREE for k in referee_ids)
+    assert report.colors_source == "detected"
+    assert report.track_coverage_pct == pytest.approx(100.0)
+    assert set(report.team_colors_hex) >= {"0", "1"}
+    detected = {report.team_colors_hex["0"], report.team_colors_hex["1"]}
+    for kit in (RED_KIT.color_hex, CYAN_KIT.color_hex):
+        assert min(_bgr_dist(kit, h) for h in detected) < 60.0
+    assert tr.detector["team_assignment"]["tracks_referee"] == len(referee_ids)
+    assert all(p.jersey_color_hex for p in tr.players.values())
+
+
+def _swap_teams(tracking):
+    tr = copy.deepcopy(tracking)
+    for p in tr.players.values():
+        if p.team in (0, 1):
+            p.team = 1 - p.team
+    return tr
+
+
+def test_assign_track_teams_with_supplied_colours(synthetic_kits) -> None:
+    path, gt = synthetic_kits
+    truth = {k: p.team for k, p in gt.tracking.players.items()}
+    # Slightly-off picker colours (as a user would choose them).
+    tr = assign_track_teams(str(path), _unlabelled(gt.tracking), TeamConfig("A", "#d32f2f"),
+                            TeamConfig("B", "#00bcd4"), sample_hz=1.0)
+    assert _accuracy(tr, truth) >= 0.9
+    assert all(0.0 < p.team_confidence <= 1.0 for p in tr.players.values())
+    # Supplying the kits the other way round swaps the labels.
+    swapped = assign_track_teams(str(path), _unlabelled(gt.tracking), CYAN_KIT, RED_KIT, sample_hz=1.0)
+    assert _accuracy(_swap_teams(swapped), truth) >= 0.9
+    assert all(swapped.players[k].team == TEAM_REFEREE for k, v in truth.items() if v == TEAM_REFEREE)
+
+
+def test_assign_track_teams_labels_short_fragments_via_extra_frames(synthetic_kits) -> None:
+    """Fragmented tracks (3 s pieces) with a sparse uniform sample still get labelled."""
+    path, gt = synthetic_kits
+    fragmented = _unlabelled(gt.tracking)
+    pieces = {}
+    truth = {}
+    next_id = 100
+    for p in fragmented.players.values():
+        for start in np.arange(0.0, 12.0, 3.0):
+            m = (p.t >= start) & (p.t < start + 2.8)  # no two pieces at one instant
+            if not m.any():
+                continue
+            pieces[next_id] = PlayerTrack(next_id, p.t[m], p.x1[m], p.y1[m], p.x2[m], p.y2[m], p.conf[m])
+            truth[next_id] = gt.tracking.players[p.track_id].team
+            next_id += 1
+    fragmented.players = pieces
+    tr, report = assign_track_teams_with_report(str(path), fragmented, RED_KIT, CYAN_KIT, sample_hz=0.1)
+    assert report.frames_planned > 2  # the uniform sample alone is 2 frames
+    assert report.track_coverage_pct >= 90.0
+    assert _accuracy(tr, truth) >= 0.9
+
+
+def test_assign_track_teams_unreadable_video_is_graceful(tmp_path, synthetic_kits) -> None:
+    _, gt = synthetic_kits
+    tr, report = assign_track_teams_with_report(str(tmp_path / "missing.mp4"), _unlabelled(gt.tracking))
+    assert report.frames_read == 0
+    assert all(p.team == TEAM_UNKNOWN for p in tr.players.values())
