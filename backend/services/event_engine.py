@@ -102,7 +102,7 @@ class EventEngineConfig:
     shot_heading_change_deg: float = 30.0
     shot_goal_region_frac: float = 0.12  # of field width from the goal line
     shot_max_origin_frac: float = 0.65  # shots start within this of the goal line
-    shot_target_margin_goal_heights: float = 1.0
+    shot_target_margin_goal_heights: float = 2.0  # real-size goal boxes are ~11% of field height
     shot_end_lookahead_s: float = 1.5
     shot_shooter_radius_m: float = 4.0
     shot_kick_accel_ratio: float = 1.35
@@ -604,7 +604,13 @@ def _detect_shots(ctx: _Context, goal_events: Sequence[GoalEvent]) -> List[Event
         unit = "m/s"
     else:
         speed = np.hypot(vx, vy)
-        threshold = cfg.shot_speed_frame_widths_per_s * ctx.metric.frame_w
+        # Without a calibration, scale the metric shot speed by the field's
+        # pixel length (the field spans pitch_length_m); the frame-width
+        # fraction only acts as a cap so a mis-estimated field cannot make
+        # ordinary passes look like shots.
+        px_per_m = geometry.width / max(1.0, cfg.pitch_length_m) if geometry.width > 0 else 0.0
+        metric_threshold = cfg.shot_speed_mps * px_per_m if px_per_m > 0 else float("inf")
+        threshold = min(metric_threshold, cfg.shot_speed_frame_widths_per_s * ctx.metric.frame_w)
         unit = "px/s"
     speed = np.nan_to_num(speed, nan=0.0)
     heading = np.arctan2(vy, vx)
