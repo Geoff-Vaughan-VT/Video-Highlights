@@ -35,13 +35,45 @@ def _model_dir(cli_value: str | None) -> Path:
     return Path(env) if env else REPO_ROOT / "models"
 
 
-def _download(name: str, target: Path) -> None:
+# Ultralytics publishes every stock weight file as a GitHub release asset.
+# Fetching it over plain HTTPS keeps this script free of the ultralytics /
+# OpenCV import, which needs X11 libraries that slim builder images lack.
+ASSET_RELEASE = os.getenv("VH_ULTRALYTICS_ASSETS_RELEASE", "v8.3.0")
+ASSET_URL = "https://github.com/ultralytics/assets/releases/download/{release}/{name}"
+
+
+def _download_direct(name: str, target: Path) -> None:
+    import urllib.request
+
+    url = ASSET_URL.format(release=ASSET_RELEASE, name=name)
+    tmp = target.with_suffix(target.suffix + ".part")
+    request = urllib.request.Request(url, headers={"User-Agent": "video-highlights/download_models"})
+    with urllib.request.urlopen(request, timeout=120) as response, tmp.open("wb") as handle:
+        shutil.copyfileobj(response, handle, length=1024 * 1024)
+    if not _valid(tmp):
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"download of {url} produced no usable file")
+    tmp.replace(target)
+
+
+def _download_with_ultralytics(name: str, target: Path) -> None:
     from ultralytics.utils.downloads import attempt_download_asset
 
     # Ultralytics downloads release assets straight to the path it is given.
     result = Path(attempt_download_asset(str(target)))
     if result.resolve() != target.resolve() and result.exists():
         shutil.copy2(result, target)
+
+
+def _download(name: str, target: Path) -> None:
+    try:
+        _download_direct(name, target)
+        return
+    except Exception as direct_exc:
+        try:
+            _download_with_ultralytics(name, target)
+        except Exception as ultra_exc:
+            raise RuntimeError(f"direct: {direct_exc}; ultralytics: {ultra_exc}") from ultra_exc
 
 
 def _valid(path: Path) -> bool:
