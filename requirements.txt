@@ -1,39 +1,8 @@
-# Video Highlights Generator - Python Dependencies
-
-# Computer Vision & Object Tracking
-ultralytics>=8.0.0,<9.0.0
-opencv-python>=4.5.0
-
-# Data Processing
-numpy>=1.19.0
-
-# Progress Bars
-tqdm>=4.60.0
-
-# Video Processing
-moviepy>=1.0.0
-
-# Audio Processing
-librosa>=0.9.0
-soundfile>=0.10.0
-
-# System Information (for GUI hardware display)
-psutil>=5.8.0
-
-# Optional: For better performance
-# torch>=2.0.0  # Uncomment if you want to use GPU acceleration with YOLO
-# torchvision>=0.15.0
-
-# Backend API (V1)
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-sqlmodel>=0.0.22
-openai>=1.30.0
-python-multipart>=0.0.9
-requests>=2.32.0
-
-# Testing framework
-pytest>=8.3.0
-pytest-cov>=6.0.0
-PyJWT>=2.9.0
-boto3>=1.36.0
+# Umbrella: full local install (API + worker + ML + tests).
+# Install the right torch build first (see requirements-ml.txt), then:
+#   pip install -r requirements.txt
+# Split files:
+#   requirements-base.txt  API/worker control plane, no ML
+#   requirements-ml.txt    + torch, ultralytics, librosa (processing worker)
+#   requirements-dev.txt   + pytest (tests, bench)
+-r requirements-dev.txt

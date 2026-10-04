@@ -42,9 +42,16 @@ on-demand clip API.
 `camera_decisions.jsonl`: one row per output frame
 `{index, t, t_source, center_x, center_y, zoom, state, focus, reason, confidence, ball_x, ball_y, ball_source, target_x, target_y}`.
 
-`camera_crops.txt`: ffmpeg `sendcmd` script, one command per frame
-`<t> crop w <w>, crop h <h>, crop x <x>, crop y <y>;` in source pixels (even
-integers). Produced by the planner, consumed by the renderer.
+`camera_crops.txt`: ffmpeg `sendcmd` script with one line per rect **change**
+(never per unchanged frame): `0.0000 crop w 2400, crop h 1350, crop x 720, crop y 404;`.
+Commas separate commands, `;` ends the line, times are processing-window
+seconds (4 decimals, fired half a frame early), values are even integers in
+source pixels, crop aspect == output aspect. Usable directly as
+`ffmpeg -i src -vf "sendcmd=f=camera_crops.txt,crop=<first rect>,null,scale=OW:OH:flags=bicubic:threads=1"`;
+the `null` filter between `crop` and `scale` is required or ffmpeg 6.1 hangs
+when the crop size changes. The renderer builds equivalent per-chunk scripts
+from `CameraPlan.crop_rects` (60 s chunks, concat-joined) because sendcmd
+scans every command on every frame.
 
 `camera_quality.json`: smoothness metrics for the plan
 `{pan_speed_p95_cropw_per_s, pan_accel_p95, zoom_rate_p95_per_s, zoom_reversals_per_min, hard_snaps, ball_in_frame_fraction}`.

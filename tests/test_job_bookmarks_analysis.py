@@ -56,12 +56,20 @@ def _install_fake_videohighlights(monkeypatch, bookmark_count: int = 2, captured
     monkeypatch.setitem(sys.modules, "VideoHighlights", fake)
 
 
+def _default_output_root(monkeypatch, tmp_path: Path) -> None:
+    """Runs go to <output_root>/<job_id> (no output_dir override)."""
+    from backend.config import settings
+
+    monkeypatch.setenv("VH_ALLOW_OUTPUT_DIR_OVERRIDE", "0")
+    monkeypatch.setattr(settings, "output_root", str(tmp_path / "outputs"))
+
+
 def test_analysis_only_job_persists_bookmarks_and_events(client: TestClient, monkeypatch, tmp_path: Path) -> None:
     _install_fake_videohighlights(monkeypatch, bookmark_count=2)
 
     source_video = tmp_path / "source.mp4"
     source_video.write_bytes(b"fake-video")
-    output_dir = tmp_path / "job_out"
+    _default_output_root(monkeypatch, tmp_path)
 
     match = client.post(
         "/v1/matches",
@@ -79,7 +87,6 @@ def test_analysis_only_job_persists_bookmarks_and_events(client: TestClient, mon
         json={
             "config": {
                 "analysis_only": True,
-                "output_dir": str(output_dir),
                 "model_version": "event-v1",
                 "focus_event_types": ["goal", "corner_kick"],
             }
@@ -114,7 +121,7 @@ def test_job_runner_passes_trim_window_to_pipeline(client: TestClient, monkeypat
 
     source_video = tmp_path / "source.mp4"
     source_video.write_bytes(b"fake-video")
-    output_dir = tmp_path / "trimmed_job_out"
+    _default_output_root(monkeypatch, tmp_path)
 
     match = client.post(
         "/v1/matches",
@@ -132,7 +139,6 @@ def test_job_runner_passes_trim_window_to_pipeline(client: TestClient, monkeypat
         json={
             "config": {
                 "analysis_only": True,
-                "output_dir": str(output_dir),
                 "trim_start": 15.0,
                 "trim_end": 135.0,
                 "model_version": "event-v1",
@@ -146,5 +152,6 @@ def test_job_runner_passes_trim_window_to_pipeline(client: TestClient, monkeypat
     assert run_once.status_code == 200, run_once.text
     assert run_once.json()["job_id"] == job_id
 
+    assert Path(captured["output_dir"]) == tmp_path / "outputs" / job_id
     assert captured["trim_start"] == 15.0
     assert captured["trim_end"] == 135.0

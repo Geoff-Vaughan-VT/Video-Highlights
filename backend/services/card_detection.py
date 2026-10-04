@@ -147,12 +147,20 @@ def detect_card_events(
     config: Optional[CardDetectionConfig] = None,
     debug_dir: Optional[str] = None,
     ball_track: Optional[object] = None,
+    coord_scale: float = 1.0,
 ) -> List[CardEvent]:
     """Scan stopped-play windows of ``video_path`` for raised cards.
 
     ``ball_track`` (anything with ``position_at(t)``) excludes blobs at the
     ball's known position - a yellow ball is the classic false positive.
+
+    ``coord_scale`` = ``video pixels / ball_track pixels``: the pipeline scans
+    the analysis proxy (``ProxyResult.scale``, e.g. 0.5 for a 4K source and a
+    1080p proxy) while ball positions are in source pixels. Ball positions
+    are scaled into the video's pixel space and returned card ``x``/``y`` are
+    scaled back to ball-track (source) pixels.
     """
+    scale = float(coord_scale) if coord_scale and coord_scale > 0 else 1.0
     cfg = config or CardDetectionConfig()
     cv2 = _import_cv2()
     events: List[CardEvent] = []
@@ -195,6 +203,8 @@ def detect_card_events(
                 if ball_track is not None:
                     try:
                         ball_pos = ball_track.position_at(actual_t)  # type: ignore[attr-defined]
+                        if ball_pos is not None and scale != 1.0:
+                            ball_pos = (float(ball_pos[0]) * scale, float(ball_pos[1]) * scale)
                     except Exception:
                         ball_pos = None
                 for kind, mask in masks.items():
@@ -266,6 +276,9 @@ def detect_card_events(
             continue
         merged.append(event)
     kept = [e for e in merged if e.confidence >= cfg.min_confidence]
+    if scale != 1.0:
+        for event in kept:
+            event.x, event.y = event.x / scale, event.y / scale
     for event in kept:
         LOGGER.info("card flagged: %s at t=%.1fs confidence=%.2f (%s)",
                     event.kind, event.t, event.confidence, event.reason)

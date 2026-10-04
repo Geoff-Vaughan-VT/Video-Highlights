@@ -11,7 +11,14 @@ from ..auth import UserContext, require_roles
 from ..config import settings
 from ..database import get_session
 from ..models import Event, JobLogEntry, Match, NotificationLog, ProcessingJob
-from ..schemas import JobCreate, JobRead, JobRerunRequest
+from ..schemas import (
+    JobCreate,
+    JobRead,
+    JobRerunRequest,
+    is_valid_job_id,
+    output_dir_override_allowed,
+    validate_job_config,
+)
 from ..serializers import job_log_to_read, job_to_read, notification_to_read
 from ..services.job_logging import append_job_log
 from ..services.job_runner import job_runner
@@ -26,6 +33,65 @@ def _get_tenant_job_or_404(session: Session, tenant_id: str, job_id: str) -> Pro
     if not job or job.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
     return job
+
+
+def _validated_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a job config (typed JobConfig + profile resolution); 400 on error."""
+    from pydantic import ValidationError
+
+    try:
+        return validate_job_config(raw)
+    except ValidationError as exc:
+        errors = [
+            f"{'.'.join(str(p) for p in err.get('loc', ())) or 'config'}: {err.get('msg')}" for err in exc.errors()
+        ]
+        raise HTTPException(status_code=400, detail="Invalid job config: " + "; ".join(errors)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid job config: {exc}") from exc
+
+
+def _job_output_dir(job: ProcessingJob) -> str:
+    """Where ``job`` writes: ``<output_root>/<job_id>`` (``config.output_dir``
+    only with the test override; legacy rows' stored value is ignored)."""
+    config = dict(job.config_json or {})
+    if output_dir_override_allowed() and config.get("output_dir"):
+        return str(config["output_dir"])
+    return os.path.join(settings.output_root, job.id)
+
+
+def _check_reuse_source(session: Session, tenant_id: str, match_id: str, config: Dict[str, Any]) -> None:
+    """``reuse_tracking_from_job`` must name an existing job of this tenant and match."""
+    reuse_id = config.get("reuse_tracking_from_job")
+    if not reuse_id:
+        return
+    if not is_valid_job_id(reuse_id):
+        raise HTTPException(status_code=400, detail="Invalid job config: reuse_tracking_from_job must be a job id")
+    source_job = session.get(ProcessingJob, str(reuse_id))
+    if source_job is None or source_job.tenant_id != tenant_id:
+        raise HTTPException(status_code=400, detail=f"reuse_tracking_from_job not found: {reuse_id}")
+    if source_job.match_id != match_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reuse_tracking_from_job {reuse_id} belongs to another match; tracks are per source video",
+        )
+
+
+def _rerun_base_config(parent: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """Parent config with overrides; a profile change drops the parent's
+    profile-derived (not explicitly chosen) keys so the new profile applies."""
+    from ..services.perf_profiles import PROFILE_KEYS
+
+    base = dict(parent or {})
+    new_profile = overrides.get("profile")
+    if new_profile and str(new_profile).strip().lower() != str(base.get("profile") or "").strip().lower():
+        explicit = set(base.get("profile_overrides") or [])
+        for key in PROFILE_KEYS:
+            if key not in explicit and key not in overrides:
+                base.pop(key, None)
+    base.pop("profile_overrides", None)
+    base.pop("profile_warning", None)
+    base.update(overrides or {})
+    return base
 
 
 def _mark_job_cancel_requested(session: Session, job: ProcessingJob, reason: str) -> ProcessingJob:
@@ -131,8 +197,7 @@ def _refresh_match_latest_processing_metadata(session: Session, match: Match) ->
 
 
 def _read_live_manifest_bookmarks(job: ProcessingJob) -> list[Dict[str, object]]:
-    config = dict(job.config_json or {})
-    output_dir = str(config.get("output_dir") or os.path.join(settings.output_root, job.id))
+    output_dir = _job_output_dir(job)
     manifest_path = os.path.join(output_dir, "analysis_bookmarks.json")
     if not os.path.exists(manifest_path):
         return []
@@ -258,7 +323,9 @@ def create_job(
     if not match or match.tenant_id != tenant.tenant_id:
         raise HTTPException(status_code=404, detail=f"Match not found: {match_id}")
 
-    job = ProcessingJob(tenant_id=match.tenant_id, match_id=match_id, config_json=payload.config)
+    config = _validated_config(payload.config)
+    _check_reuse_source(session, tenant.tenant_id, match_id, config)
+    job = ProcessingJob(tenant_id=match.tenant_id, match_id=match_id, config_json=config)
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -274,7 +341,7 @@ def create_job(
             "execution_mode": settings.job_execution_mode,
             "process_message": "A new processing run has been queued for this match.",
             "technical_message": "ProcessingJob row created and queued with the submitted config.",
-            "log_profile": _log_profile(payload.config),
+            "log_profile": _log_profile(config),
         },
     )
     append_job_log(
@@ -286,11 +353,11 @@ def create_job(
         message="Logging profile selected",
         detail_level="detailed",
         data={
-            "log_profile": _log_profile(payload.config),
+            "log_profile": _log_profile(config),
             "process_message": "This run will keep extra step-by-step notes for easier testing.",
             "technical_message": "Per-run log_profile controls which detailed worker checkpoints are persisted.",
         },
-        force_persist=_log_profile(payload.config) in {"detailed", "diagnostic"},
+        force_persist=_log_profile(config) in {"detailed", "diagnostic"},
     )
     append_job_log(
         session=session,
@@ -301,12 +368,12 @@ def create_job(
         message="Job configuration accepted",
         detail_level="extreme",
         data={
-            "config": payload.config,
+            "config": config,
             "process_message": "The exact run settings were captured for later comparison.",
             "technical_message": "Raw job config persisted for diagnostic replay.",
-            "log_profile": _log_profile(payload.config),
+            "log_profile": _log_profile(config),
         },
-        force_persist=_log_profile(payload.config) == "diagnostic",
+        force_persist=_log_profile(config) == "diagnostic",
     )
     _record_match_processing_mechanics(session=session, match=match, job=job, reason="create_job")
     session.commit()
@@ -488,8 +555,11 @@ def delete_job(
     tenant: TenantContext = Depends(get_tenant_context),
 ) -> Dict[str, object]:
     job = _get_tenant_job_or_404(session, tenant.tenant_id, job_id)
-    if job.status in {"running", "claimed"}:
-        raise HTTPException(status_code=409, detail="Cannot delete active job. Cancel/kill it first.")
+    if job.status in {"running", "claimed", "cancel_requested"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete an active job. Cancel/kill it first and wait until it stops.",
+        )
 
     match = session.get(Match, job.match_id)
     logs = list(
@@ -591,8 +661,15 @@ def rerun_job(
     if not match or match.tenant_id != tenant.tenant_id:
         raise HTTPException(status_code=404, detail=f"Match not found for job: {job_id}")
 
-    new_config = dict(job.config_json or {})
-    new_config.update(payload.config_overrides or {})
+    overrides = dict(payload.config_overrides or {})
+    parent_config = dict(job.config_json or {})
+    if "output_dir" not in overrides:
+        # A rerun is a new run folder (<output_root>/<new job id>); never
+        # inherit the parent's folder (legacy rows may still carry one).
+        parent_config.pop("output_dir", None)
+    new_config = _rerun_base_config(parent_config, overrides)
+    new_config = _validated_config(new_config)
+    _check_reuse_source(session, tenant.tenant_id, job.match_id, new_config)
     rerun = ProcessingJob(tenant_id=job.tenant_id, match_id=job.match_id, config_json=new_config)
     session.add(rerun)
     session.commit()

@@ -3,27 +3,32 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>Video Highlights Studio</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎥</text></svg>">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23c6f04a'/%3E%3Cpath d='M5 8.3 12 4.5l7 3.8v7.4L12 19.5l-7-3.8z' fill='none' stroke='%230d1205' stroke-width='1.8'/%3E%3C/svg%3E">
+<script>
+  // Apply the saved theme before first paint (no flash).
+  try { const t = localStorage.getItem('vh_theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
 <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
-<nav id="sidenav">
-  <div class="logo">🎥 Video Highlights <span>Studio</span></div>
-  <button class="navtoggle" id="navtoggle" aria-label="Menu">☰</button>
+<nav id="sidenav" aria-label="Primary">
+  <div class="logo"><span class="mark" id="logomark"></span><div>Video Highlights<small>Studio</small></div></div>
+  <button class="navtoggle" id="navtoggle" aria-label="Toggle menu" aria-expanded="false"></button>
   <div class="navlinks" id="navlinks">
     <div class="group">Studio</div>
-    <button data-page="matches">📋 Matches</button>
-    <button data-page="create">⬆️ Create</button>
-    <button data-page="jobs">⚙️ Jobs</button>
-    <button data-page="runs">🎬 Runs</button>
-    <div class="group">Operations</div>
-    <button data-page="_docs">🔌 API Docs</button>
+    <button class="navitem" data-page="matches" data-icon="library">Library</button>
+    <button class="navitem" data-page="create" data-icon="upload">New run</button>
+    <button class="navitem" data-page="jobs" data-icon="jobs">Jobs</button>
+    <div class="group">System</div>
+    <button class="navitem" data-page="settings" data-icon="settings">Hardware &amp; settings</button>
+    <button class="navitem" data-page="_docs" data-icon="docs">API reference</button>
     <div class="navfoot" id="navuser"></div>
   </div>
 </nav>
-<main id="main"></main>
-<div id="toasts"></div>
+<main id="main" tabindex="-1"></main>
+<div id="toasts" role="status" aria-live="polite"></div>
 <script type="module" src="js/app.js"></script>
 </body>
 </html>

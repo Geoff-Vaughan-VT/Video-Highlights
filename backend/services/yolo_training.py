@@ -5,6 +5,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 from ..config import settings
+from .perf_profiles import resolve_model_path
+
+# Stock Ultralytics weights fine-tuned when the config names no base model
+# (the "balanced" profile's detector). Resolved through VH_MODEL_DIR first.
+DEFAULT_BASE_MODEL = "yolov8s.pt"
 
 
 _SAFE_RUN_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -31,7 +36,7 @@ def build_yolo_train_args(config: Dict[str, Any]) -> Dict[str, Any]:
     if not dataset_yaml.exists() or not dataset_yaml.is_file():
         raise ValueError(f"YOLO dataset YAML was not found: {dataset_yaml}")
 
-    base_model = str(config.get("base_model") or config.get("model") or "yolo26s.pt").strip()
+    base_model = str(config.get("base_model") or config.get("model") or DEFAULT_BASE_MODEL).strip()
     if not base_model:
         raise ValueError("base_model is required for YOLO detector training.")
 
@@ -60,12 +65,12 @@ def build_yolo_train_args(config: Dict[str, Any]) -> Dict[str, Any]:
     if "freeze" in config:
         args["freeze"] = _coerce_int(config.get("freeze"), 0, 0, 1000)
 
-    return {"base_model": base_model, "args": args}
+    return {"base_model": base_model, "base_model_path": resolve_model_path(base_model), "args": args}
 
 
 def train_ultralytics_yolo(config: Dict[str, Any]) -> Dict[str, Any]:
     prepared = build_yolo_train_args(config)
-    base_model = str(prepared["base_model"])
+    base_model = str(prepared.get("base_model_path") or prepared["base_model"])
     train_args = dict(prepared["args"])
 
     from ultralytics import YOLO

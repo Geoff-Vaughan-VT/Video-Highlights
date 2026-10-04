@@ -1,88 +1,81 @@
-# Testing Framework
+# Testing
 
-This project now includes an automated testing framework designed to evolve with implementation.
-
-## 1. Goals
-
-1. Catch regressions on every backend change.
-2. Keep tests fast enough for frequent local execution.
-3. Validate critical workflows end-to-end (events, feedback, training, agent, queue mode, auth).
-
-## 2. Test Stack
-
-1. `pytest` for test execution
-2. `fastapi.testclient` for API integration testing
-3. `pytest-cov` for backend coverage reporting
-4. Isolated SQLite test DB per test function via fixture-driven engine reset
-
-## 3. Test Structure
-
-- `tests/conftest.py`: shared fixtures (isolated DB, client/auth_client)
-- `tests/test_health.py`: health and basic middleware checks
-- `tests/test_matches_events.py`: match/event API behavior
-- `tests/test_feedback_training_agent.py`: feedback/review/training/agent flows
-- `tests/test_auth_and_queue.py`: auth-required mode and queue-worker execution
-- `tests/test_validation_errors.py`: validation envelope behavior
-- `tests/test_jwt_auth.py`: JWT issue/verify and role restrictions
-- `tests/test_storage_backends.py`: local and S3-compatible storage backend behavior
-- `tests/test_contract_api.py`: OpenAPI path and schema-doc enum contract checks
-- `tests/test_multitenancy_admin.py`: tenant isolation and global/tenant admin API workflows
-- `tests/test_dev_skip_user_management.py`: seeded tenant + auto-provisioned membership test mode behavior
-- `tests/test_job_logging_and_kill.py`: job log persistence/query and kill-session behavior
-- `tests/test_job_bookmarks_analysis.py`: analysis-only bookmark manifest ingestion and job-linked event persistence
-- `tests/test_event_clip_on_demand.py`: frame-accurate bookmark clip-on-demand creation and cache reuse behavior
-- `tests/test_job_delete_and_live_bookmarks.py`: job-level bookmark feed and run deletion cleanup behavior
-- `tests/test_highlight_export_selected.py`: selected-bookmark highlight export generation and metadata persistence
-
-## 4. Running Tests
-
-Run full suite:
+## Commands
 
 ```bash
-python -m pytest
-```
-
-Install lightweight backend test dependencies:
-
-```bash
-pip install -r requirements-backend-test.txt
-```
-
-Run with coverage:
-
-```bash
+python -m pytest -q -p no:cacheprovider            # whole suite (CI command)
+python -m pytest -q -p no:cacheprovider tests/test_perf_profiles.py tests/test_gpu_status.py
 python -m pytest --cov=backend --cov-report=term-missing
+./run_tests.sh   |   run_tests.bat                 # same as the first line, extra args pass through
+python bench/bench_match.py --minutes 0.2 --height 360   # bench smoke (CI job bench-smoke)
 ```
 
-Convenience scripts:
+`pytest.ini` sets `pythonpath = .`, `testpaths = tests`, `addopts = -q`.
+`-p no:cacheprovider` keeps `.pytest_cache` out of the tree (and out of
+read-only checkouts).
 
-```bash
-run_tests.bat
-```
+## Dependencies
 
-```bash
-./run_tests.sh
-```
+| File | Use |
+|---|---|
+| `requirements-dev.txt` | Full suite + bench: ML stack + pytest. Install CPU torch first: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`. |
+| `requirements-backend-test.txt` | API-only subset (no torch/ultralytics). Tests needing the ML stack or ffmpeg skip or fail. |
 
-## 5. CI
+ffmpeg on `PATH` is required for the media tests (frame source, render,
+clips, synthetic match via ffmpeg).
 
-GitHub Actions workflow:
+## Layout
 
-- File: `.github/workflows/ci.yml`
-- Installs `requirements-backend-test.txt`
-- Runs pytest with coverage output
+* `tests/conftest.py`: isolated SQLite DB per test (`isolated_db`),
+  `client` / `auth_client` TestClients with settings reset per test.
+* API and control plane: `test_health`, `test_matches_events`,
+  `test_feedback_training_agent`, `test_auth_and_queue`, `test_validation_errors`,
+  `test_jwt_auth`, `test_storage_backends`, `test_contract_api`,
+  `test_multitenancy_admin`, `test_dev_skip_user_management`,
+  `test_job_logging_and_kill`, `test_job_bookmarks_analysis`,
+  `test_event_clip_on_demand`, `test_job_delete_and_live_bookmarks`,
+  `test_highlight_export_selected`, `test_rbac_and_upload`, `test_studio_api`.
+* Product features: `test_match_stats`, `test_roster_and_assignment`,
+  `test_roster_templates`, `test_player_routing`, `test_sharing`,
+  `test_source_catalog`, `test_upload_validation`, `test_notifications`,
+  `test_llm_agent_local`, `test_match_report`, `test_yolo_training`.
+* Pipeline (v2 workstreams): `test_frame_source`, `test_detectors`,
+  `test_tracking_engine`, `test_player_focus`, `test_team_classification`,
+  `test_game_tracking`, `test_set_pieces_and_cards`, `test_goal_bookmarks`,
+  `test_camera_planner`, `test_camera_render`, `test_follow_cam`,
+  `test_full_follow_cam_export`, `test_event_follow_cam_router`,
+  `test_broadcast`, `test_highlight_fallback`, `test_media_timeline`,
+  `test_audio_editor`. Most run on `backend/services/synthetic_match.py`
+  footage with exact ground truth.
+* Platform: `test_perf_profiles` (profile table, `resolve_job_config`
+  precedence, model family swap, `resolve_model_path`, `estimate_runtime`
+  shape and ordering, `classify_hardware` for every class) and
+  `test_gpu_status` (mocked `subprocess.run` + fake `torch` module for an
+  RTX rig, Apple Silicon, NVENC-listed-but-no-GPU, no ffmpeg/torch, and
+  `VH_DEVICE` override).
+* Root-level `test_api_smoke.py`, `test_api_auth_queue.py`,
+  `test_performance.py` are manual scripts against a running API, not part
+  of the pytest run.
 
-## 6. Test Design Notes
+## CI (`.github/workflows/ci.yml`)
 
-1. Each test runs against an isolated SQLite DB configured by fixtures.
-2. Queue mode is used in tests to avoid non-deterministic inline async background behavior.
-3. Auth-required flows are tested with token-role mappings.
-4. Tenant-scoped isolation is validated with explicit cross-tenant access checks.
-5. Tests avoid requiring heavy CV runtime dependencies for fast CI.
+* `tests`: Python 3.11, apt ffmpeg, CPU torch + `requirements-dev.txt`,
+  `bash -n` on every shell script, compose YAML parse, then
+  `python -m pytest -q -p no:cacheprovider`.
+* `bench-smoke`: CPU torch + `requirements-ml.txt`, cached weights,
+  `bench/bench_match.py --minutes 0.2 --height 360 --detect-frames 4`,
+  uploads `bench/results/*` as an artifact. CPU fps are for harness checks
+  only.
 
-## 7. Next Testing Enhancements
+`docker-publish.yml` builds the images on `v*` tags (see `docs/DEPLOYMENT.md`).
 
-1. Add negative/edge tests for large payload and pagination boundaries.
-2. Add performance benchmarks for queue-worker throughput.
-3. Add integration tests for real processing runs in a GPU-capable pipeline environment.
-4. Add API contract snapshot tests across versions.
+## Conventions
+
+1. Each test gets its own SQLite DB; queue mode avoids background threads.
+2. Hardware is mocked, never required: torch via `sys.modules`, ffmpeg and
+   `nvidia-smi` via `subprocess.run` monkeypatching.
+3. Media tests use synthetic footage with ground truth, generated in
+   `tmp_path`, seconds long.
+4. `PLAN.md` acceptance criteria (camera smoothness, stats accuracy, both
+   scripted goals found, decode-pass count) are being turned into tests on
+   the synthetic match during the v2 integration.

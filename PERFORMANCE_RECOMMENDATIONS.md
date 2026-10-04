@@ -1,62 +1,65 @@
 # Performance Recommendations
 
-This document captures high-value next steps beyond the optimizations already implemented in the local pipeline.
+Tuning guide for the v2 pipeline plus the next optimizations worth doing.
+Measure first: `python bench/bench_match.py --minutes 2 --height 2160`.
 
-## Priority 1: Platform Throughput
+## Picking settings
 
-1. Move processing to queued asynchronous jobs with worker autoscaling.
-2. Separate analysis workers from rendering workers.
-3. Persist intermediate artifacts in object storage for retry-safe stages.
+| Situation | Do |
+|---|---|
+| First run on a new match / smoke test | `profile: fast` and a trim window (`trim_start`/`trim_end`) |
+| Normal processing on an RTX 30/40/50, Spark | `balanced` (default) |
+| Small players far from the camera, ball lost often | `quality` (imgsz 1536, `yolov8m`, ball tiles) or `balanced` + `inference_imgsz: 1536` |
+| Apple Silicon | `balanced` on Ultra-class; `fast` on Max and smaller |
+| CPU only | `fast` with a trim window; full matches take hours |
+| Want newer weights | `VH_MODEL_FAMILY=yolo26` (same sizes), or a fine-tuned `best.pt` as `yolo_model` |
+| Repeated runs on one CUDA box | `VH_TENSORRT=1` with a GPU image built `INSTALL_TENSORRT=1`; keep `/models` on a volume so engines persist |
 
-Expected outcome:
+Detection + tracking is 50-80% of runtime on GPUs. Cost scales with
+`(imgsz)^2 / vid_stride` and model size (n 1.7x, s 1x, m 0.5x the
+throughput of s). Proxy and render are fixed per match and bound by
+NVDEC/NVENC (or VideoToolbox) throughput.
 
-- Better throughput under concurrent workloads
-- More reliable reruns and lower restart cost
+## Host settings
 
-## Priority 2: Model and Pipeline Efficiency
+1. Put `VH_OUTPUT_ROOT` (`/data`) and sources on NVMe; the proxy pass reads
+   the whole source and the render reads it again.
+2. Docker Desktop (Windows): raise WSL2 `memory`/`processors` in
+   `.wslconfig`; keep sources on a local NTFS drive (bind mounts from
+   network shares are slow).
+3. GPU worker: `ipc: host` and a large `shm_size` are set in compose; keep
+   them.
+4. One worker per GPU. Do not run `worker` and `worker-gpu` together (queue
+   claim is not atomic, `docs/DEPLOYMENT.md`).
+5. Stop other GPU users (games, local LLMs) during processing; Ollama models
+   unload after each answer by default (`VH_LLM_KEEP_ALIVE=0`).
 
-1. Add optional frame-skipping and interpolation profiles.
-2. Introduce caching for repeated runs with unchanged inputs/config.
-3. Evaluate detector upgrades only when quality gain justifies latency increase.
+## Next optimizations
 
-Expected outcome:
+1. **Atomic queue claim** (`UPDATE ... WHERE status='queued'` /
+   `SKIP LOCKED`) so several workers can share a queue, then per-GPU workers.
+2. **GPU-resident proxy**: `-hwaccel cuda -hwaccel_output_format cuda` with
+   `scale_cuda` and NVENC keeps frames on the GPU; the distro ffmpeg supports
+   it. Same for the final render (crop on the CPU is the remaining copy).
+3. **Decode straight to tensors** (NVDEC -> torch via PyNvVideoCodec or
+   torchaudio's StreamReader) to skip the proxy re-decode on CUDA hosts.
+4. **Chunked, resumable jobs**: split long matches into segments with
+   overlap so a crash resumes instead of restarting, and segments can run on
+   several GPUs.
+5. **INT8 TensorRT** for the detector after a calibration set exists from
+   reviewed matches.
+6. **Persist per-stage timings** from `progress.json` into the job record so
+   the estimator can be calibrated from real runs per hardware class.
 
-- Lower GPU minutes per match
-- Faster turnaround for iterative workflows
+## Benchmark matrix
 
-## Priority 3: Media Processing
+| Dimension | Values |
+|---|---|
+| Source | 1080p30, 4K30 (Falcon), 4K60 |
+| Length | bench 2 min, projection 90 min; one real full match per release |
+| Hardware | each `hardware_class` in `perf_profiles.HARDWARE_CLASSES` |
+| Profile | fast, balanced, quality; TensorRT on/off on CUDA |
 
-1. Keep NVENC as preferred encoder on supported hardware.
-2. Add profile-based encoding settings (`fast`, `balanced`, `quality`).
-3. Segment very long matches into resumable chunks.
-
-Expected outcome:
-
-- Reduced encoding bottlenecks
-- Better failure recovery on long jobs
-
-## Priority 4: Quality Operations and Observability
-
-1. Capture stage-level metrics (`track`, `detect`, `render`, `export`).
-2. Store event confidence plus reviewer correction feedback.
-3. Run regression benchmarks against labeled datasets on each major change.
-
-Expected outcome:
-
-- Controlled quality evolution with measurable performance impact
-
-## Recommended Benchmark Matrix
-
-Benchmark dimensions:
-
-1. Resolution and frame rate: 1080p30, 1080p60, 4K30
-2. Match length: 20, 45, 90 minutes
-3. Compute mode: CPU-only and GPU-enabled
-4. Feature mode: overlay on/off, audio on/off
-
-Track metrics:
-
-1. End-to-end wall time
-2. GPU utilization and peak memory
-3. Event precision/recall on labeled set
-4. Cost per processed match
+Track: per-stage fps and seconds (bench JSON), end-to-end wall time, GPU
+utilization and peak memory, camera quality metrics (`camera_quality.json`)
+and event precision/recall on labeled matches.

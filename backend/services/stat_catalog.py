@@ -149,6 +149,52 @@ def _possession_stat(artifact: Dict[str, Any], home: Optional[str], away: Option
     return {"mapped": mapped, "raw": raw}
 
 
+# Catalog keys the v2 stats engine (match_stats.team_stats_for_catalog) fills.
+TRACKING_V2_KEYS = ("goals", "possession", "total_shots", "shots_on_target", "total_passes", "pass_accuracy", "corners")
+TRACKING_V2_METHOD = "tracking_v2"
+
+
+def _tracking_v2_values(artifact: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """``{key: {"home": v, "away": v}}`` from a v2 ``analysis_team_stats.json`` (``teams`` key)."""
+    if not isinstance(artifact.get("teams"), dict):
+        return {}
+    try:
+        from .match_stats import team_stats_for_catalog
+
+        mapped = team_stats_for_catalog(artifact)
+    except Exception:
+        return {}
+    home = mapped.get("home") or {}
+    away = mapped.get("away") or {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key in TRACKING_V2_KEYS:
+        h, a = home.get(key), away.get(key)
+        if h is None and a is None:
+            continue
+        try:
+            out[key] = {"home": None if h is None else float(h), "away": None if a is None else float(a)}
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _apply_tracking_v2(value: StatValue, v2: Dict[str, Any], artifact: Dict[str, Any]) -> None:
+    value.available = True
+    value.reason = None
+    value.method = TRACKING_V2_METHOD
+    value.home, value.away = v2.get("home"), v2.get("away")
+    value.unattributed = 0.0 if value.unit == "count" else None
+    if value.unit == "count":
+        value.total = float(value.home or 0.0) + float(value.away or 0.0)
+    else:
+        value.total = None
+    names = {}
+    for key, team in (artifact.get("teams") or {}).items():
+        if isinstance(team, dict) and team.get("name"):
+            names[str(key)] = team.get("name")
+    value.raw = {**dict(value.raw or {}), "source": "analysis_team_stats.json (v2)", "team_names": names}
+
+
 def compute_match_stat_catalog(
     session: Session,
     match: Match,
@@ -171,6 +217,7 @@ def compute_match_stat_catalog(
     home = match.home_team_name
     away = match.away_team_name
     artifact = _load_team_stats_artifact(job)
+    tracking_v2 = _tracking_v2_values(artifact)
     has_analysis = job is not None or bool(events)
     source = get_source_type(str((match.metadata_json or {}).get("source_type") or "") or None)
 
@@ -222,6 +269,9 @@ def compute_match_stat_catalog(
                 value.reason = "team_stats_artifact_missing"
         elif key in NOT_YET_DETECTED:
             value.reason = "not_detected_by_pipeline"
+        # v2 tracking stats win over event counts (which stay as fallback).
+        if key in tracking_v2:
+            _apply_tracking_v2(value, tracking_v2[key], artifact)
         stats.append(value)
 
     return MatchStatsRead(
@@ -233,6 +283,7 @@ def compute_match_stat_catalog(
             "has_completed_job": job is not None,
             "event_count": len(events),
             "team_stats_artifact": bool(artifact),
+            "team_stats_version": "v2" if tracking_v2 else ("v1" if artifact else None),
             "source_type": source.key,
             "source_label": source.label,
             "source_supported_stat_count": len(source.supported_stats),

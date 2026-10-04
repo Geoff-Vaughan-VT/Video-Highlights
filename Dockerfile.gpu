@@ -1,58 +1,119 @@
-# CUDA-accelerated image for NVIDIA hardware: gaming/workstation rigs (x86_64)
-# and NVIDIA DGX Spark / Grace-based systems (arm64). The base image and the
-# PyTorch wheel index are both overridable so one file serves every setup.
+# syntax=docker/dockerfile:1.7
+# NVIDIA GPU image (worker, or the whole stack) for x86_64 RTX rigs and the
+# arm64 DGX Spark.
 #
-#   High-end x86 rig (RTX 30/40/50 series):
+# The base is the CUDA *base* image (driver shim + cudart only): PyTorch
+# wheels bundle their own CUDA/cuDNN/cuBLAS, so a cudnn-runtime base would
+# ship CUDA twice (~3 GB) for nothing.
+#
+#   RTX 30/40/50 (x86_64, CUDA 12.8 wheels, covers Blackwell):
 #     docker build -f Dockerfile.gpu -t video-highlights:gpu .
 #
-#   NVIDIA DGX Spark (GB10, arm64) - build on the Spark itself or cross-build:
-#     docker buildx build --platform linux/arm64 \
-#       --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu130 \
-#       -f Dockerfile.gpu -t video-highlights:gpu-arm64 .
+#   DGX Spark (GB10, arm64, CUDA 13 driver) - build on the Spark, or with
+#   buildx --platform linux/arm64 from x86:
+#     docker build -f Dockerfile.gpu \
+#       --build-arg CUDA_IMAGE=nvidia/cuda:13.0.1-base-ubuntu24.04 \
+#       --build-arg TORCH_INDEX=cu130 -t video-highlights:gpu-arm64 .
 #
-# Run with the GPU exposed (NVIDIA Container Toolkit required):
-#     docker run --gpus all --ipc=host -p 8000:8000 \
-#       -v vh-data:/app/outputs video-highlights:gpu
+#   TensorRT engine export (VH_TENSORRT=1 at runtime):
+#     --build-arg INSTALL_TENSORRT=1
+#
+# ffmpeg: Ubuntu 24.04's ffmpeg 6.1 is built with nv-codec-headers, so
+# `-hwaccel cuda`, `h264_nvenc`/`hevc_nvenc`, `scale_cuda` and `hwupload_cuda`
+# work as soon as the container sees the driver with the `video` capability
+# (NVIDIA_DRIVER_CAPABILITIES below). No custom ffmpeg build is needed.
+# Verify: docker run --rm --gpus all video-highlights:gpu ffmpeg -hide_banner -hwaccels
+#
+# Python: Ubuntu 24.04 system Python 3.12 (the code targets 3.11+).
 
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
-FROM ${CUDA_IMAGE}
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-base-ubuntu24.04
 
-# cu128 wheels ship for both x86_64 and aarch64 (SBSA) and cover Blackwell.
-# Use cu130 for the DGX Spark's CUDA 13 driver stack.
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+# ---------------------------------------------------------------- builder --
+FROM ${CUDA_IMAGE} AS builder
 
-ENV PYTHONUNBUFFERED=1 \
+# cu128 (x86_64 + aarch64 SBSA wheels) or cu130 for the Spark; a full URL works too.
+ARG TORCH_INDEX=cu128
+ARG INSTALL_TENSORRT=0
+ARG MODELS="yolov8n.pt yolov8s.pt"
+
+ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
-    # "video" grants NVENC/NVDEC inside the container so ffmpeg can use
-    # h264_nvenc for GPU-encoded clip rendering, not just CUDA compute.
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv python3-dev build-essential ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/venv
+
+WORKDIR /build
+COPY requirements-base.txt requirements-ml.txt ./
+RUN set -eux; \
+    case "${TORCH_INDEX}" in http*) idx="${TORCH_INDEX}" ;; *) idx="https://download.pytorch.org/whl/${TORCH_INDEX}" ;; esac; \
+    pip install --upgrade pip wheel; \
+    pip install torch torchvision --index-url "${idx}"; \
+    pip install -r requirements-ml.txt; \
+    if [ "${INSTALL_TENSORRT}" = "1" ]; then \
+      case "${TORCH_INDEX}" in *cu13*) trt=tensorrt-cu13 ;; *) trt=tensorrt-cu12 ;; esac; \
+      pip install "${trt}" "onnx>=1.12" onnxslim; \
+    fi
+
+COPY scripts/download_models.py scripts/download_models.py
+COPY yolov8n.pt /build/seed/yolov8n.pt
+RUN python scripts/download_models.py --model-dir /models --seed-dir /build/seed ${MODELS}
+
+# ---------------------------------------------------------------- runtime --
+FROM ${CUDA_IMAGE} AS runtime
+
+ARG VH_UID=10001
+ARG VH_GID=10001
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 ffmpeg libgl1 libglib2.0-0 libsndfile1 curl tini ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --gid "${VH_GID}" vh \
+ && useradd --uid "${VH_UID}" --gid vh --create-home --shell /usr/sbin/nologin vh \
+ && mkdir -p /data/db /data/outputs /data/storage /media /models \
+ && chown -R vh:vh /data /models
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder --chown=vh:vh /models /models
+
+# NVIDIA_DRIVER_CAPABILITIES: "video" exposes NVDEC/NVENC to ffmpeg,
+# "compute" is CUDA for torch, "utility" is nvidia-smi.
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    VH_MODEL_DIR=/models \
+    YOLO_CONFIG_DIR=/home/vh/.config/Ultralytics \
+    VH_DB_URL=sqlite:////data/db/video_highlights.db \
+    VH_OUTPUT_ROOT=/data/outputs \
+    VH_LOCAL_STORAGE_ROOT=/data/storage \
+    VH_JOB_EXECUTION_MODE=queue \
+    VH_DEVICE=auto \
+    VH_API_PORT=8000
 
 WORKDIR /app
+COPY requirements*.txt ./
+COPY VideoHighlights.py ./
+COPY backend ./backend
+COPY frontend ./frontend
+COPY scripts ./scripts
+COPY docker ./docker
+RUN chmod 0755 /app/docker/*.sh
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-venv \
-    python3-pip \
-    ffmpeg \
-    libgl1 \
-    libglib2.0-0 \
-    libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
+USER vh
+RUN python scripts/download_models.py --model-dir /models --configure-ultralytics --allow-missing
 
-# Ubuntu 24.04 enforces PEP 668; a venv keeps pip installs clean.
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
-
-# CUDA torch must land before ultralytics so its torch dependency is already
-# satisfied and the CPU wheel never gets pulled in.
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip \
-    && pip install torch torchvision --index-url ${TORCH_INDEX} \
-    && pip install -r /app/requirements.txt
-
-COPY . /app
-RUN chmod +x /app/docker/start_all.sh
-
+VOLUME ["/data"]
 EXPOSE 8000
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["python", "/app/docker/healthcheck.py"]
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/app/docker/start_all.sh"]

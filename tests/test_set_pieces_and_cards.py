@@ -309,3 +309,36 @@ def test_stopped_play_windows_merges_and_pads() -> None:
     ]
     windows = stopped_play_windows(segments, pad_s=2.0)
     assert windows == [(8.0, 22.0), (58.0, 65.0)]
+
+
+def test_set_pieces_and_cards_pass_through_event_engine() -> None:
+    from backend.services.card_detection import CardEvent
+    from backend.services.event_engine import detect_events
+    from backend.services.tracking_types import TrackingResult, ball_detections_from_rows, player_track_from_rows
+
+    geometry = _geometry()
+    detections, t_kick = _stationary_then_kick(geometry.x_max - 15.0, geometry.y_max - 15.0)
+    track = build_ball_track(detections, FRAME)
+    set_pieces = detect_set_pieces(track, geometry, 0.0, 10.0)
+    assert any(sp.kind == "corner_kick" for sp in set_pieces)
+
+    def _player(tid, team, x, y):
+        rows = [(i / 10.0, x - 10, y - 50, x + 10, y) for i in range(101)]
+        return player_track_from_rows(tid, rows, team=team)
+
+    taker = _player(1, 0, geometry.x_max - 25.0, geometry.y_max - 10.0)
+    players = {1: taker, 2: _player(2, 0, 700.0, 500.0), 3: _player(3, 1, 1500.0, 500.0)}
+    tracking = TrackingResult(fps=10.0, frame_size=FRAME, duration_s=10.0, players=players,
+                              ball=ball_detections_from_rows(detections))
+    card = CardEvent(t=8.0, kind="red_card", confidence=0.7, x=900.0, y=400.0, reason="red card shown")
+    events = detect_events(tracking, track, geometry, [], [], set_pieces, [card])
+
+    corners = events.by_type("corner_kick")
+    assert len(corners) == 1
+    assert corners[0].player_track_id == 1 and corners[0].team == 0
+    assert corners[0].side == "right"
+    assert abs(corners[0].t - t_kick) < 1.0
+    assert 0.3 <= corners[0].excitement <= 0.6
+    reds = events.by_type("red_card")
+    assert len(reds) == 1 and reds[0].confidence == pytest.approx(0.7)
+    assert "vision" in reds[0].sources

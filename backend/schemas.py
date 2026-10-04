@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class CursorPage(BaseModel):
@@ -21,6 +25,14 @@ EventType = Literal[
     "kickoff",
     "foul",
     "save",
+    "yellow_card",
+    "red_card",
+    # v2 event engine types (analysis_events.json)
+    "chance",
+    "sprint",
+    "dribble",
+    "turnover",
+    "foul_candidate",
 ]
 
 EventStatus = Literal["auto_detected", "confirmed", "corrected", "rejected"]
@@ -82,6 +94,430 @@ class MatchRead(BaseModel):
     updated_at: datetime
 
 
+CameraMode = Literal["wide", "follow_ball", "follow_player", "follow_action"]
+CameraStyle = Literal["broadcast", "tight", "wide"]
+ReelPreset = Literal["1min", "3min", "5min", "10min"]
+
+_JOB_LOGGER = logging.getLogger("videohighlights.job_config")
+_HEX_COLOR = re.compile(r"^#?[0-9a-fA-F]{6}$")
+_DEVICE = re.compile(r"^(auto|cpu|mps|cuda(:\d+)?)$")
+
+
+_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_URL_LIKE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def output_dir_override_allowed() -> bool:
+    """``VH_ALLOW_OUTPUT_DIR_OVERRIDE=1`` lets a job config choose ``output_dir``.
+
+    Off by default: API jobs always write to ``<output_root>/<job_id>``. The
+    override exists for test suites that seed run folders; it is read on
+    every call so tests can toggle it.
+    """
+    return os.getenv("VH_ALLOW_OUTPUT_DIR_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_valid_job_id(value: object) -> bool:
+    """Job ids are ``job_<hex>``; accept ``[A-Za-z0-9_-]{1,64}`` (no dots, no separators)."""
+    return isinstance(value, str) and bool(_JOB_ID.match(value))
+
+
+def media_roots() -> List[Path]:
+    """Allowed media roots from ``VH_MEDIA_ROOTS`` (comma/os.pathsep separated)."""
+    raw = os.getenv("VH_MEDIA_ROOTS", "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for chunk in raw.split(",") for p in chunk.split(os.pathsep) if p.strip()]
+    return [Path(p).expanduser().resolve() for p in parts]
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def check_media_path(value: str, *, field: str = "video_path") -> Path:
+    """Resolve a source-video path and enforce the media-root policy.
+
+    * Never inside ``output_root`` (run folders hold other jobs' proxies and
+      movies; reading them as a "source" would leak them across tenants).
+    * With ``VH_MEDIA_ROOTS`` set: must be inside one of those roots or the
+      local upload storage root.
+    * Without it: any other path is accepted (local single-user installs).
+
+    Raises ``ValueError`` with a user-facing message.
+    """
+    from .config import settings
+
+    text = str(value or "")
+    if not text.strip() or "\x00" in text:
+        raise ValueError(f"{field} is empty or invalid")
+    resolved = Path(text.strip()).expanduser().resolve()
+    storage_root = Path(settings.local_storage_root).expanduser().resolve()
+    output_root = Path(settings.output_root).expanduser().resolve()
+    if _is_within(resolved, storage_root):
+        return resolved
+    if _is_within(resolved, output_root):
+        raise ValueError(f"{field} must not point inside the output root ({output_root})")
+    roots = media_roots()
+    if roots and not any(_is_within(resolved, root) for root in roots):
+        raise ValueError(f"{field} must be under a VH_MEDIA_ROOTS directory or the upload storage root")
+    return resolved
+
+
+def is_url_like(value: object) -> bool:
+    """True for ``scheme://...`` sources (links), which are not filesystem paths."""
+    return isinstance(value, str) and bool(_URL_LIKE.match(value.strip()))
+
+
+def _check_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        try:
+            value = float(str(value))
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be a number") from None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be finite")
+    return number
+
+
+def _validate_player_roi(value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """``{x1_norm, y1_norm, x2_norm, y2_norm}`` (0..1) or ``{x, y, w, h}``
+    (pixels, or 0..1 with ``normalized: true``), plus optional ``t`` /
+    ``time_s`` / ``window_s`` seconds."""
+    if not value:
+        return None
+    roi = dict(value)
+    norm_keys = ("x1_norm", "y1_norm", "x2_norm", "y2_norm")
+    box_keys = ("x", "y", "w", "h")
+    if all(k in roi for k in norm_keys):
+        x1, y1, x2, y2 = (_check_number(roi[k], f"player_roi.{k}") for k in norm_keys)
+        if not all(0.0 <= v <= 1.0 for v in (x1, y1, x2, y2)):
+            raise ValueError("player_roi *_norm values must be between 0 and 1")
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("player_roi needs x2_norm > x1_norm and y2_norm > y1_norm")
+        roi.update({"x1_norm": x1, "y1_norm": y1, "x2_norm": x2, "y2_norm": y2})
+    elif all(k in roi for k in box_keys):
+        x, y, w, h = (_check_number(roi[k], f"player_roi.{k}") for k in box_keys)
+        if x < 0 or y < 0 or w <= 0 or h <= 0:
+            raise ValueError("player_roi needs x, y >= 0 and w, h > 0")
+        if roi.get("normalized") and (x + w > 1.0 + 1e-6 or y + h > 1.0 + 1e-6):
+            raise ValueError("normalized player_roi must fit inside 0..1")
+        roi.update({"x": x, "y": y, "w": w, "h": h})
+    else:
+        raise ValueError("player_roi must have x1_norm/y1_norm/x2_norm/y2_norm or x/y/w/h")
+    for key in ("t", "time_s", "window_s"):
+        if roi.get(key) is not None:
+            number = _check_number(roi[key], f"player_roi.{key}")
+            if number < 0:
+                raise ValueError(f"player_roi.{key} must be >= 0")
+            roi[key] = number
+    if "normalized" in roi and not isinstance(roi["normalized"], bool):
+        raise ValueError("player_roi.normalized must be true or false")
+    return roi
+
+
+def _validate_goal_box(value: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    """``{x1, y1, x2, y2}`` in source pixels (or all <= 1.0: normalized)."""
+    if not value:
+        return None
+    box = dict(value)
+    try:
+        x1, y1, x2, y2 = (_check_number(box[k], f"{name}.{k}") for k in ("x1", "y1", "x2", "y2"))
+    except KeyError:
+        raise ValueError(f"{name} must have x1, y1, x2, y2") from None
+    if min(x1, y1, x2, y2) < 0:
+        raise ValueError(f"{name} coordinates must be >= 0")
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"{name} needs x2 > x1 and y2 > y1")
+    box.update({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    return box
+
+
+def _parse_seconds(value: Union[float, int, str, None]) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    parts = text.split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError(f"invalid time {value!r}; use seconds, MM:SS or HH:MM:SS")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(f"invalid time {value!r}; use seconds, MM:SS or HH:MM:SS") from exc
+    total = 0.0
+    for n in nums:
+        total = total * 60.0 + n
+    return total
+
+
+class JobConfig(BaseModel):
+    """Typed processing-job configuration (unknown legacy keys are kept).
+
+    Profile keys (``proxy_height``, ``inference_imgsz``, ``vid_stride``,
+    ``yolo_model``, ``batch_size``, ``output_height``, ``debug_video``,
+    ``ball_tiles``, ``tracker_config``) left unset come from ``profile`` via
+    :func:`resolve_job_config`.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    profile: Optional[str] = None
+    camera_mode: Optional[CameraMode] = None
+    camera_style: Optional[CameraStyle] = None
+    zoom_factor: Optional[float] = Field(default=None, ge=1.0, le=4.0)
+    render_full_follow_cam: Optional[bool] = None
+    output_height: Optional[int] = Field(default=None, ge=240, le=2160)
+    proxy_height: Optional[int] = Field(default=None, ge=240, le=2160)
+    inference_imgsz: Optional[int] = Field(default=None, ge=160, le=4096)
+    vid_stride: Optional[int] = Field(default=None, ge=1, le=30)
+    yolo_model: Optional[str] = None
+    tracker_config: Optional[str] = None
+    detection_conf: Optional[float] = Field(default=None, gt=0.0, lt=1.0)
+    batch_size: Optional[Union[int, str]] = None
+    use_tensorrt: Optional[bool] = None
+    ball_tiles: Optional[bool] = None
+    device: Optional[str] = None
+    focus_track_id: Optional[int] = Field(default=None, ge=0)
+    player_roi: Optional[Dict[str, Any]] = None
+    goal_box_left: Optional[Dict[str, Any]] = None
+    goal_box_right: Optional[Dict[str, Any]] = None
+    reuse_tracking_from_job: Optional[str] = None
+    pitch_corners: Optional[List[List[float]]] = None
+    reel_minutes: Optional[float] = Field(default=None, gt=0.0, le=120.0)
+    reel_preset: Optional[ReelPreset] = None
+    player_spotlight_reel: Optional[bool] = None
+    team_left: Optional[str] = Field(default=None, max_length=80)
+    team_right: Optional[str] = Field(default=None, max_length=80)
+    team_left_color: Optional[str] = None
+    team_right_color: Optional[str] = None
+    auto_detect_team_colors: Optional[bool] = None
+    detect_cards: Optional[bool] = None
+    broadcast_reel: Optional[bool] = None
+    scorebug: Optional[bool] = None
+    debug_video: Optional[bool] = None
+    dump_training_data: Optional[bool] = None
+    llm_report: Optional[bool] = None
+    trim_start: Optional[Union[float, str]] = None
+    trim_end: Optional[Union[float, str]] = None
+    analysis_only: Optional[bool] = None
+    pre_seconds: Optional[float] = Field(default=None, ge=0.0, le=120.0)
+    post_seconds: Optional[float] = Field(default=None, ge=0.0, le=120.0)
+    min_clip_duration: Optional[float] = Field(default=None, ge=0.0, le=600.0)
+    no_audio: Optional[bool] = None
+    overlay: Optional[bool] = None
+    threads: Optional[int] = Field(default=None, ge=1, le=64)
+    require_gpu: Optional[bool] = None
+    select_player: Optional[bool] = None
+    video_path: Optional[str] = None
+    output_dir: Optional[str] = None
+
+    @field_validator("profile")
+    @classmethod
+    def _check_profile(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        from .services.perf_profiles import PROFILES
+
+        key = str(value).strip().lower()
+        if key not in PROFILES:
+            raise ValueError(f"unknown profile {value!r}; expected one of {', '.join(PROFILES)}")
+        return key
+
+    @field_validator("batch_size")
+    @classmethod
+    def _check_batch(cls, value: Optional[Union[int, str]]) -> Optional[Union[int, str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if value.strip().lower() == "auto":
+                return "auto"
+            if not value.strip().isdigit():
+                raise ValueError("batch_size must be 'auto' or a positive integer")
+            value = int(value.strip())
+        if int(value) < 1 or int(value) > 256:
+            raise ValueError("batch_size must be between 1 and 256")
+        return int(value)
+
+    @field_validator("device")
+    @classmethod
+    def _check_device(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        if not _DEVICE.match(str(value).strip().lower()):
+            raise ValueError("device must be auto, cpu, mps, cuda or cuda:N")
+        return str(value).strip().lower()
+
+    @field_validator("team_left_color", "team_right_color")
+    @classmethod
+    def _check_color(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if not _HEX_COLOR.match(text):
+            raise ValueError("colors must be hex like #d32f2f")
+        return text if text.startswith("#") else f"#{text}"
+
+    @field_validator("pitch_corners")
+    @classmethod
+    def _check_corners(cls, value: Optional[List[List[float]]]) -> Optional[List[List[float]]]:
+        if value is None:
+            return None
+        if len(value) != 4 or any(len(p) != 2 for p in value):
+            raise ValueError("pitch_corners must be 4 [x, y] points (TL, TR, BR, BL)")
+        points = [[_check_number(p[0], "pitch_corners"), _check_number(p[1], "pitch_corners")] for p in value]
+        if any(v < 0 for p in points for v in p):
+            raise ValueError("pitch_corners coordinates must be >= 0")
+        if len({(round(p[0], 3), round(p[1], 3)) for p in points}) != 4:
+            raise ValueError("pitch_corners must be 4 distinct points")
+        return points
+
+    @field_validator("player_roi")
+    @classmethod
+    def _check_roi(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        return _validate_player_roi(value)
+
+    @field_validator("goal_box_left", "goal_box_right")
+    @classmethod
+    def _check_goal_box(cls, value: Optional[Dict[str, Any]], info) -> Optional[Dict[str, Any]]:  # noqa: ANN001
+        if value is None:
+            return None
+        return _validate_goal_box(value, info.field_name)
+
+    @field_validator("reuse_tracking_from_job")
+    @classmethod
+    def _check_reuse(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if not is_valid_job_id(text):
+            raise ValueError("reuse_tracking_from_job must be a job id (letters, digits, '_' or '-')")
+        return text
+
+    @field_validator("yolo_model")
+    @classmethod
+    def _check_model(cls, value: Optional[str]) -> Optional[str]:
+        """Stock/bare weight names, or a file inside the model directory
+        (``VH_MODEL_DIR``); arbitrary filesystem paths are rejected."""
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if "\x00" in text:
+            raise ValueError("invalid model name")
+        if _MODEL_NAME.match(text) and ".." not in text:
+            return text
+        from .services.perf_profiles import model_dir
+
+        root = model_dir().expanduser().resolve()
+        candidate = Path(text).expanduser()
+        resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+        if not _is_within(resolved, root):
+            raise ValueError("yolo_model must be a stock model name or a file inside VH_MODEL_DIR")
+        return str(resolved)
+
+    @field_validator("tracker_config")
+    @classmethod
+    def _check_tracker(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if not _MODEL_NAME.match(text) or ".." in text:
+            raise ValueError("tracker_config must be a tracker name like bytetrack.yaml or botsort.yaml")
+        return text
+
+    @field_validator("select_player")
+    @classmethod
+    def _check_select(cls, value: Optional[bool]) -> Optional[bool]:
+        if value:
+            raise ValueError(
+                "select_player opens an interactive window and cannot run on the API worker; "
+                "use player_roi or focus_track_id instead"
+            )
+        return value
+
+    @field_validator("video_path")
+    @classmethod
+    def _check_video_path(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        resolved = check_media_path(str(value), field="video_path")
+        if media_roots() and not resolved.is_file():
+            raise ValueError(f"video_path does not exist: {resolved}")
+        if not media_roots():
+            from .config import settings
+
+            storage = Path(settings.local_storage_root).expanduser().resolve()
+            if not _is_within(resolved, storage):
+                _JOB_LOGGER.warning(
+                    "video_path %s is outside the storage root; set VH_MEDIA_ROOTS to restrict job paths", resolved,
+                )
+        return str(resolved)
+
+    @field_validator("output_dir")
+    @classmethod
+    def _check_output_dir(cls, value: Optional[str]) -> Optional[str]:
+        """API jobs always write to ``<output_root>/<job_id>``; ``output_dir``
+        is only accepted with ``VH_ALLOW_OUTPUT_DIR_OVERRIDE=1`` (tests)."""
+        if value is None or not str(value).strip():
+            return None
+        if not output_dir_override_allowed():
+            raise ValueError("output_dir is not accepted; runs are always written to <output_root>/<job_id>")
+        from .config import settings
+
+        if "\x00" in str(value):
+            raise ValueError("invalid path")
+        resolved = Path(str(value)).expanduser().resolve()
+        allowed = [Path(settings.output_root).expanduser().resolve(),
+                   Path(settings.local_storage_root).expanduser().resolve()] + media_roots()
+        if media_roots() and not any(_is_within(resolved, root) for root in allowed):
+            raise ValueError("output_dir must be under the output root or a VH_MEDIA_ROOTS directory")
+        return str(resolved)
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "JobConfig":
+        start = _parse_seconds(self.trim_start)
+        end = _parse_seconds(self.trim_end)
+        if start is not None and start < 0:
+            raise ValueError("trim_start must be >= 0")
+        if end is not None and end <= 0:
+            raise ValueError("trim_end must be > 0")
+        if start is not None and end is not None and end <= start:
+            raise ValueError("trim_end must be greater than trim_start")
+        return self
+
+
+def validate_job_config(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Validate ``raw`` as :class:`JobConfig` and lay the profile defaults under it.
+
+    Returns the stored config: explicit keys (including unknown legacy keys)
+    plus the resolved profile keys, ``profile`` and ``profile_overrides``.
+    Raises ``ValueError`` / ``pydantic.ValidationError`` on invalid input.
+    """
+    from .services.perf_profiles import resolve_job_config
+
+    model = JobConfig.model_validate(dict(raw or {}))
+    explicit = {k: v for k, v in model.model_dump().items() if v is not None}
+    for key in ("output_dir", "video_path"):
+        if key in (raw or {}) and (raw or {}).get(key) is None:
+            explicit.pop(key, None)
+    return resolve_job_config(explicit, strict=True)
+
+
 class JobCreate(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
@@ -129,7 +565,7 @@ class Participant(BaseModel):
 
 class SignalExplanation(BaseModel):
     signal: str
-    value: float
+    value: Union[float, str, bool, None] = None
 
 
 class EventSource(BaseModel):

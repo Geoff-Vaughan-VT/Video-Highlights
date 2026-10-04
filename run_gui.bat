@@ -40,7 +40,7 @@ if errorlevel 1 (
     echo.
     echo NOTE: PyTorch not installed - GPU acceleration unavailable
     echo For better performance, install PyTorch with CUDA:
-    echo   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+    echo   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
     echo.
     echo Press any key to continue with CPU mode...
     pause >nul
@@ -78,12 +78,12 @@ echo.
 echo Installing PyTorch with CUDA support...
 echo This download is large (~2GB). Please wait...
 echo.
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 if errorlevel 1 (
     echo.
     echo WARNING: Failed to install GPU support
     echo You can still use CPU mode, or install manually later:
-    echo   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+    echo   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
     echo.
 )
 goto :launch_gui
@@ -111,7 +111,7 @@ if errorlevel 1 (
     echo   pip install -r requirements.txt
     echo.
     echo For GPU support (2-3x faster):
-    echo   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+    echo   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
     echo.
     pause
 )

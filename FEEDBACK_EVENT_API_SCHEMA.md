@@ -24,6 +24,13 @@ This document defines concrete payloads and endpoints for event storage, reviewe
 - `kickoff`
 - `foul`
 - `save`
+- `yellow_card`
+- `red_card`
+- `chance` (v2 event engine)
+- `sprint` (v2 event engine)
+- `dribble` (v2 event engine)
+- `turnover` (v2 event engine)
+- `foul_candidate` (v2 event engine)
 
 ### 2.2 Event Status
 

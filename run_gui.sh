@@ -54,12 +54,12 @@ if ! python3 -c "import numpy" &> /dev/null; then
             echo "Installing PyTorch with CUDA support..."
             echo "This download is large (~2GB). Please wait..."
             echo
-            pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+            pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
             if [ $? -ne 0 ]; then
                 echo
                 echo "WARNING: Failed to install GPU support"
                 echo "You can still use CPU mode, or install manually later:"
-                echo "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118"
+                echo "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128"
                 echo
             fi
         fi
@@ -80,7 +80,7 @@ elif python3 -c "import torch" 2>/dev/null; then
 else
     echo "NOTE: PyTorch not installed - GPU acceleration unavailable"
     echo "For better performance, install PyTorch with CUDA:"
-    echo "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118"
+    echo "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128"
     echo
 fi
 
@@ -101,7 +101,7 @@ if [ $? -ne 0 ]; then
     echo "  pip install -r requirements.txt"
     echo
     echo "For GPU support (2-3x faster):"
-    echo "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118"
+    echo "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128"
     echo
     exit 1
 fi

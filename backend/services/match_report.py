@@ -48,6 +48,17 @@ def _fallback_report(summary: Dict[str, object]) -> str:
     ts = summary.get("team_stats") or {}
     if ts.get("possession_pct"):
         lines.append(f"- Possession: {ts['possession_pct']}")
+    teams = ts.get("teams") if isinstance(ts.get("teams"), dict) else {}
+    for key in sorted(teams):
+        team = teams[key] if isinstance(teams[key], dict) else {}
+        lines.append(
+            f"- {team.get('name') or 'Team ' + str(key)}: possession {team.get('possession_pct')}%, "
+            f"shots {team.get('shots')} ({team.get('shots_on_target')} on target), passes {team.get('passes')}, "
+            f"goals {team.get('goals')}"
+        )
+    counts = (summary.get("events_summary") or {}).get("counts_by_type") or {}
+    if counts:
+        lines.append("- Events: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     lines.append("")
     lines.append("Set VH_LLM_PROVIDER=ollama and VH_LLM_MODEL to enable narrated reports.")
     return chr(10).join(lines)

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlmodel import select
 
@@ -20,6 +22,14 @@ from .notifications import notify_job_terminal_state
 from .player_routing import route_match_events
 from .yolo_training import train_ultralytics_yolo
 from ..utils import ensure_dir
+
+
+#: Test hook: when set, ``process_video_highlights`` gets this as
+#: ``detector_factory`` (e.g. a ground-truth detector on synthetic footage).
+DETECTOR_FACTORY_OVERRIDE: Optional[Callable[[Dict[str, object]], object]] = None
+
+#: Seconds between cancel polls of the job row while the pipeline runs.
+CANCEL_POLL_S = 1.0
 
 
 def _utcnow() -> datetime:
@@ -172,11 +182,48 @@ def _normalize_event_type(value: object, fallback: str = "shot") -> str:
         "save",
         "yellow_card",
         "red_card",
+        "chance",
+        "sprint",
+        "dribble",
+        "turnover",
+        "foul_candidate",
     }
     event_type = str(value or "").strip().lower()
     if event_type in allowed:
         return event_type
     return fallback
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _team_side(team: object) -> Optional[str]:
+    """Analysis team index -> catalog bucket (0 = home, 1 = away)."""
+    try:
+        value = int(team)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return {0: "home", 1: "away"}.get(value)
+
+
+def _explanations(signals: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Signal rows; numbers stay numbers, strings/bools stay as they are."""
+    rows: List[Dict[str, Any]] = []
+    for key, value in (signals or {}).items():
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            rows.append({"signal": str(key), "value": float(value)})
+        else:
+            rows.append({"signal": str(key), "value": value})
+    return rows
 
 
 def _sync_job_events_from_manifest(
@@ -185,10 +232,18 @@ def _sync_job_events_from_manifest(
     match: Match,
     config: Dict[str, object],
     manifest: Dict[str, object],
+    output_dir: Optional[str] = None,
 ) -> int:
-    bookmarks = list(manifest.get("bookmarks", []) or [])
+    """Replace this job's Event rows with the run's analysis.
 
-    # If this job was retried, replace prior rows for deterministic results.
+    v2 runs (``analysis_events.json`` present): one row per analysis event,
+    ``source_json.analysis_event_id`` = event id, team_id ``home``/``away``,
+    track ids in ``participants_json``; reel-selected events keep the
+    bookmark window/ids. Legacy runs: one row per bookmark.
+    """
+    bookmarks = [b for b in list(manifest.get("bookmarks", []) or []) if isinstance(b, dict)]
+    run_dir = Path(output_dir or config.get("output_dir") or os.path.join(settings.output_root, job.id))
+
     existing = list(
         session.exec(
             select(Event)
@@ -200,47 +255,146 @@ def _sync_job_events_from_manifest(
     for item in existing:
         session.delete(item)
 
-    detector_version = str(config.get("model_version") or "event-v0")
+    detector_version = str(config.get("model_version") or "event-v2")
     follow_cam_mode = str(config.get("camera_mode") or "wide").strip().lower()
     follow_cam_zoom = float(config.get("zoom_factor", 1.6) or 1.6)
     source_asset_id = _primary_source_asset_id(match)
+    resolved_dir = run_dir.resolve()
+    base_evidence = {
+        "source_asset_id": source_asset_id,
+        "analysis_manifest_path": str(resolved_dir / "analysis_bookmarks.json"),
+        "tracking_manifest_path": str(resolved_dir / "analysis_tracking.json"),
+    }
+    base_source = {
+        "detector_version": detector_version,
+        "follow_cam_version": "camera-planner-v2" if follow_cam_mode != "wide" else None,
+        "camera_mode": follow_cam_mode,
+        "zoom_factor": follow_cam_zoom,
+    }
+
+    def _window(start_s: float, end_s: float, occurred_s: float) -> Tuple[int, int, int]:
+        start_ms = max(0, int(round(start_s * 1000.0)))
+        end_ms = max(start_ms, int(round(end_s * 1000.0)))
+        occurred_ms = min(max(start_ms, int(round(occurred_s * 1000.0))), end_ms)
+        return start_ms, end_ms, occurred_ms
+
+    events_doc = _read_json_file(run_dir / "analysis_events.json")
+    analysis_events = [e for e in list(events_doc.get("events") or []) if isinstance(e, dict)]
     created = 0
+    if analysis_events:
+        trim = float(events_doc.get("trim_offset_seconds", manifest.get("trim_offset_seconds", 0.0)) or 0.0)
+        tracks_meta = _read_json_file(run_dir / "tracks_meta.json")
+        jerseys = {
+            int(p.get("track_id")): p.get("jersey_number")
+            for p in list(tracks_meta.get("players") or [])
+            if isinstance(p, dict) and p.get("track_id") is not None
+        }
+        frame_w = float(tracks_meta.get("frame_width") or 0.0)
+        frame_h = float(tracks_meta.get("frame_height") or 0.0)
+        bookmark_by_event = {str(b.get("event_id")): b for b in bookmarks if b.get("event_id")}
+        for ev in analysis_events:
+            ev_id = str(ev.get("id") or "")
+            bookmark = bookmark_by_event.get(ev_id)
+            t = float(ev.get("t", 0.0) or 0.0)
+            if bookmark:
+                start_s = float(bookmark.get("start_s", t + trim) or 0.0)
+                end_s = float(bookmark.get("end_s", t + trim) or 0.0)
+            else:
+                t_start = ev.get("t_start")
+                t_end = ev.get("t_end")
+                start_s = (float(t_start) if t_start is not None else t - 4.0) + trim
+                end_s = (float(t_end) if t_end is not None else t + 6.0) + trim
+            start_ms, end_ms, occurred_ms = _window(start_s, end_s, t + trim)
+            team_id = _team_side(ev.get("team"))
+            participants: List[Dict[str, Any]] = []
+            jersey: Optional[str] = None
+            for role, key in (("primary", "player_track_id"), ("secondary", "secondary_track_id")):
+                tid = ev.get(key)
+                if tid is None:
+                    continue
+                number = jerseys.get(int(tid))
+                if role == "primary" and number not in (None, ""):
+                    jersey = str(number)
+                participants.append({
+                    "team_id": team_id if role == "primary" else None,
+                    "player_id": None,
+                    "jersey_number": str(number) if number not in (None, "") else None,
+                    "role": role,
+                    "track_id": int(tid),
+                })
+            evidence_src = dict(ev.get("evidence") or {})
+            location: Dict[str, Any] = {}
+            ball_xy = evidence_src.get("ball_xy")
+            if isinstance(ball_xy, (list, tuple)) and len(ball_xy) >= 2 and frame_w > 0 and frame_h > 0:
+                location = {
+                    "x_norm": round(float(ball_xy[0]) / frame_w, 4),
+                    "y_norm": round(float(ball_xy[1]) / frame_h, 4),
+                }
+            if isinstance(evidence_src.get("pitch_xy_m"), (list, tuple)):
+                location["pitch_xy_m"] = list(evidence_src["pitch_xy_m"])[:2]
+            signals = dict((bookmark or {}).get("signals") or {})
+            signals.setdefault("excitement", ev.get("excitement"))
+            signals.setdefault("reason", ev.get("reason"))
+            if ev.get("side") is not None:
+                signals.setdefault("side", ev.get("side"))
+            event = Event(
+                tenant_id=job.tenant_id,
+                match_id=job.match_id,
+                job_id=job.id,
+                event_type=_normalize_event_type(ev.get("type"), fallback="shot"),
+                status="auto_detected",
+                confidence=min(1.0, max(0.0, float(ev.get("confidence", 0.0) or 0.0))),
+                period=None,
+                occurred_at_ms=occurred_ms,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                frame_index=0,
+                team_id=team_id,
+                player_id=None,
+                jersey_number=jersey,
+                source_json={
+                    **base_source,
+                    "detector": "videohighlights-event-engine-v2",
+                    "analysis_event_id": ev_id,
+                    "analysis_event_type": ev.get("type"),
+                    "bookmark_id": (bookmark or {}).get("bookmark_id"),
+                    "bookmark_label": (bookmark or {}).get("label"),
+                    "reel_selected": bookmark is not None,
+                    "clip_index": (bookmark or {}).get("clip_index"),
+                    "team": ev.get("team"),
+                    "team_name": ev.get("team_name"),
+                    "side": ev.get("side"),
+                    "player_track_id": ev.get("player_track_id"),
+                    "excitement": ev.get("excitement"),
+                    "sources": list(ev.get("sources") or []),
+                },
+                location_json=location,
+                participants_json=participants,
+                evidence_json={
+                    **base_evidence,
+                    "bookmark_id": (bookmark or {}).get("bookmark_id"),
+                    "analysis_events_path": str(resolved_dir / "analysis_events.json"),
+                    **{k: evidence_src[k] for k in ("ball_xy", "pitch_xy_m", "card_crop_path", "on_target")
+                       if k in evidence_src},
+                },
+                explanations_json=_explanations(signals),
+            )
+            session.add(event)
+            created += 1
+        return created
+
     for bookmark in bookmarks:
-        if not isinstance(bookmark, dict):
-            continue
         start_s = float(bookmark.get("start_s", 0.0) or 0.0)
         end_s = float(bookmark.get("end_s", start_s) or start_s)
         occurred_s = float(bookmark.get("occurred_at_s", (start_s + end_s) / 2.0) or 0.0)
-
-        start_ms = max(0, int(round(start_s * 1000.0)))
-        end_ms = max(start_ms, int(round(end_s * 1000.0)))
-        occurred_ms = int(round(occurred_s * 1000.0))
-        occurred_ms = min(max(start_ms, occurred_ms), end_ms)
-
-        confidence = float(bookmark.get("confidence", 0.0) or 0.0)
-        confidence = min(1.0, max(0.0, confidence))
-        event_type = _normalize_event_type(bookmark.get("event_type"), fallback="shot")
-
+        start_ms, end_ms, occurred_ms = _window(start_s, end_s, occurred_s)
+        confidence = min(1.0, max(0.0, float(bookmark.get("confidence", 0.0) or 0.0)))
         signals = bookmark.get("signals", {}) if isinstance(bookmark.get("signals", {}), dict) else {}
-        explanations = []
-        for key, value in signals.items():
-            try:
-                explanations.append({"signal": str(key), "value": float(value)})
-            except Exception:
-                continue
-
-        evidence = {
-            "source_asset_id": source_asset_id,
-            "bookmark_id": bookmark.get("bookmark_id"),
-            "analysis_manifest_path": str(Path(config.get("output_dir") or os.path.join(settings.output_root, job.id)).resolve() / "analysis_bookmarks.json"),
-            "tracking_manifest_path": str(Path(config.get("output_dir") or os.path.join(settings.output_root, job.id)).resolve() / "analysis_tracking.json"),
-        }
-
         event = Event(
             tenant_id=job.tenant_id,
             match_id=job.match_id,
             job_id=job.id,
-            event_type=event_type,
+            event_type=_normalize_event_type(bookmark.get("event_type"), fallback="shot"),
             status="auto_detected",
             confidence=confidence,
             period=None,
@@ -248,26 +402,135 @@ def _sync_job_events_from_manifest(
             start_ms=start_ms,
             end_ms=end_ms,
             frame_index=0,
-            team_id=None,
+            team_id=_team_side(bookmark.get("team")),
             player_id=None,
             jersey_number=None,
             source_json={
+                **base_source,
                 "detector": "videohighlights-multi-factor",
-                "detector_version": detector_version,
-                "follow_cam_version": "follow-cam-v0" if follow_cam_mode != "wide" else None,
-                "camera_mode": follow_cam_mode,
-                "zoom_factor": follow_cam_zoom,
+                "analysis_event_id": bookmark.get("event_id"),
+                "bookmark_id": bookmark.get("bookmark_id"),
                 "bookmark_label": bookmark.get("label"),
                 "sources": bookmark.get("sources", []),
             },
             location_json={},
             participants_json=[],
-            evidence_json=evidence,
-            explanations_json=explanations,
+            evidence_json={**base_evidence, "bookmark_id": bookmark.get("bookmark_id")},
+            explanations_json=_explanations(signals),
         )
         session.add(event)
         created += 1
     return created
+
+
+class JobSetupError(RuntimeError):
+    """A job cannot start (bad source path, unusable reuse source...); the
+    message is user-facing and becomes ``job.error_message``."""
+
+
+def _job_output_dir(job: ProcessingJob, config: Dict[str, Any], reuse_dir: Optional[str] = None) -> str:
+    """``<output_root>/<job id>``; never the reused run's folder.
+
+    ``config.output_dir`` is honoured only with ``VH_ALLOW_OUTPUT_DIR_OVERRIDE``
+    (test suites); legacy rows that stored one are ignored, so ``build_proxy``
+    (which clears ``<output_dir>/thumbs``) only ever touches this job's folder.
+    """
+    from ..schemas import output_dir_override_allowed
+
+    default = os.path.join(settings.output_root, job.id)
+    output_dir = str(config.get("output_dir") or default) if output_dir_override_allowed() else default
+    if reuse_dir and os.path.abspath(output_dir) == os.path.abspath(reuse_dir):
+        output_dir = default
+    return output_dir
+
+
+def _resolve_video_path(config: Dict[str, Any], match: Match) -> str:
+    """The job's source video, checked against the media-root policy."""
+    from ..schemas import check_media_path
+
+    raw = str(config.get("video_path") or match.source_video_path or "").strip()
+    if not raw:
+        raise JobSetupError("Match has no source video path")
+    try:
+        return str(check_media_path(raw, field="video_path"))
+    except ValueError as exc:
+        raise JobSetupError(f"Video path rejected: {exc}") from exc
+
+
+def _resolve_reuse_dir(session, job: ProcessingJob, reuse_job_id: Optional[object]) -> Optional[str]:
+    """Run directory of ``reuse_tracking_from_job`` (same tenant, inside the
+    output root) holding ``tracks.npz``; raises :class:`JobSetupError` otherwise.
+
+    Never falls back to a bare ``<output_root>/<id>`` without a DB row: the
+    id must name a job of this tenant.
+    """
+    if not reuse_job_id:
+        return None
+    from ..schemas import _is_within, is_valid_job_id, output_dir_override_allowed
+    from .tracking_types import TrackingResult
+
+    reuse_id = str(reuse_job_id).strip()
+    if not is_valid_job_id(reuse_id):
+        raise JobSetupError("reuse_tracking_from_job must be a job id")
+    source = session.get(ProcessingJob, reuse_id)
+    if source is None or source.tenant_id != job.tenant_id:
+        raise JobSetupError(f"reuse_tracking_from_job not found: {reuse_id}")
+    if source.id == job.id:
+        raise JobSetupError("reuse_tracking_from_job cannot be the job itself")
+    root = Path(settings.output_root).expanduser().resolve()
+    res = dict(source.result_json or {})
+    cfg = dict(source.config_json or {})
+    candidates: List[str] = []
+    if res.get("output_dir"):
+        candidates.append(str(res["output_dir"]))
+    if output_dir_override_allowed() and cfg.get("output_dir"):
+        candidates.append(str(cfg["output_dir"]))
+    candidates.append(os.path.join(settings.output_root, source.id))
+    for cand in candidates:
+        resolved = Path(cand).expanduser().resolve()
+        if not output_dir_override_allowed() and (resolved == root or not _is_within(resolved, root)):
+            continue
+        if TrackingResult.exists(str(resolved)):
+            return str(resolved)
+    raise JobSetupError(
+        f"reuse_tracking_from_job {reuse_id} has no reusable tracks (tracks.npz) in its run folder"
+    )
+
+
+def _fail_job_setup(session, job: ProcessingJob, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+    job.status = "failed"
+    job.stage = "failed"
+    job.progress = 1.0
+    job.error_message = message
+    job.updated_at = _utcnow()
+    job.completed_at = _utcnow()
+    session.add(job)
+    append_job_log(
+        session=session,
+        job_id=job.id,
+        tenant_id=job.tenant_id,
+        level="error",
+        stage="failed",
+        message=message,
+        detail_level="basic",
+        data=dict(data or {}),
+    )
+    notify_job_terminal_state(session, job)
+
+
+def _failure_reason_from_progress(output_dir: str) -> Optional[str]:
+    """``progress.json`` message of a failed run (fallback when the engine
+    progress callback never delivered a failure reason)."""
+    payload = _read_json_file(Path(output_dir) / "progress.json")
+    if str(payload.get("status") or payload.get("stage") or "").lower() == "failed":
+        message = str(payload.get("message") or "").strip()
+        return message or None
+    return None
+
+
+#: Persist an unchanged engine heartbeat as a job-log row at most this often
+#: (job.progress is still updated on every heartbeat).
+HEARTBEAT_LOG_INTERVAL_S = 30.0
 
 
 class JobRunner:
@@ -379,8 +642,14 @@ class JobRunner:
                 )
 
                 config = job.config_json or {}
-                video_path = config.get("video_path") or match.source_video_path
-                output_dir = config.get("output_dir") or os.path.join(settings.output_root, job.id)
+                try:
+                    video_path = _resolve_video_path(config, match)
+                    reuse_dir = _resolve_reuse_dir(session, job, config.get("reuse_tracking_from_job"))
+                except JobSetupError as setup_error:
+                    _fail_job_setup(session, job, str(setup_error),
+                                    {"reuse_tracking_from_job": config.get("reuse_tracking_from_job")})
+                    return
+                output_dir = _job_output_dir(job, config, reuse_dir)
                 ensure_dir(output_dir)
                 _append_process_log(
                     session=session,
@@ -526,8 +795,13 @@ class JobRunner:
                     )
                     return
 
-                video_path = config.get("video_path") or match.source_video_path
-                output_dir = config.get("output_dir") or os.path.join(settings.output_root, job.id)
+                try:
+                    video_path = _resolve_video_path(config, match)
+                    reuse_dir = _resolve_reuse_dir(session, job, config.get("reuse_tracking_from_job"))
+                except JobSetupError as setup_error:
+                    _fail_job_setup(session, job, str(setup_error))
+                    return
+                output_dir = _job_output_dir(job, config, reuse_dir)
                 gpu_status = get_gpu_status()
                 _append_process_log(
                     session=session,
@@ -593,19 +867,57 @@ class JobRunner:
                             "zoom_factor": config.get("zoom_factor", 1.6),
                             "render_full_follow_cam": bool(config.get("render_full_follow_cam", False)),
                             "player_roi_enabled": isinstance(config.get("player_roi"), dict),
-                            "yolo_model": config.get("yolo_model", "yolo26s.pt"),
-                            "tracker_config": config.get("tracker_config", "botsort.yaml"),
-                            "inference_imgsz": config.get("inference_imgsz", 960),
+                            "profile": config.get("profile"),
+                            "yolo_model": config.get("yolo_model"),
+                            "tracker_config": config.get("tracker_config"),
+                            "inference_imgsz": config.get("inference_imgsz"),
                             "detection_conf": config.get("detection_conf", 0.18),
-                            "vid_stride": config.get("vid_stride", 1),
+                            "vid_stride": config.get("vid_stride"),
+                            "proxy_height": config.get("proxy_height"),
+                            "output_height": config.get("output_height"),
+                            "focus_track_id": config.get("focus_track_id"),
+                            "reuse_tracking_from_job": config.get("reuse_tracking_from_job"),
                         },
                     )
 
+            cancel_event = threading.Event()
+            cancel_state: Dict[str, Any] = {"last_poll": 0.0}
+
+            def _poll_cancel(force: bool = False) -> None:
+                """Read job.cancel_requested from the DB and set the pipeline's cancel event."""
+                if cancel_event.is_set():
+                    return
+                now_mono = time.monotonic()
+                if not force and now_mono - float(cancel_state["last_poll"]) < CANCEL_POLL_S:
+                    return
+                cancel_state["last_poll"] = now_mono
+                try:
+                    with session_scope() as poll_session:
+                        polled = poll_session.get(ProcessingJob, job_id)
+                        if polled is not None and (
+                            polled.cancel_requested or str(polled.status or "").lower() in {"cancel_requested", "canceled"}
+                        ):
+                            cancel_event.set()
+                except Exception:
+                    pass
+
+            watcher_stop = threading.Event()
+
+            def _cancel_watcher() -> None:
+                while not watcher_stop.wait(CANCEL_POLL_S):
+                    _poll_cancel(force=True)
+                    if cancel_event.is_set():
+                        return
+
             progress_state: Dict[str, Any] = {
                 "last_at": None,
+                "last_log_at": None,
                 "last_progress": 0.0,
+                "last_logged_progress": 0.0,
                 "last_sub_stage": "",
                 "last_message": "",
+                "final_logged": False,
+                "failure": None,
             }
 
             def _record_engine_progress(
@@ -614,25 +926,36 @@ class JobRunner:
                 message: str,
                 data: Optional[Dict[str, object]] = None,
             ) -> None:
+                _poll_cancel()
                 stage_key = str(sub_stage or "processing").strip().lower()
                 message_text = str(message or stage_key).strip()
+                if stage_key == "failed":
+                    # Keep the engine's own reason for job.error_message.
+                    reason = (data or {}).get("error") if isinstance(data, dict) else None
+                    reason_text = str(reason or "").strip() or message_text
+                    if reason_text and (reason or not progress_state.get("failure")):
+                        progress_state["failure"] = reason_text
                 try:
                     progress_value = max(0.0, min(0.99, float(progress)))
                 except Exception:
                     progress_value = float(progress_state.get("last_progress") or 0.0)
                 now = _utcnow()
-                last_at = progress_state.get("last_at")
-                seconds_since_last = (
-                    (now - last_at).total_seconds()
-                    if isinstance(last_at, datetime)
-                    else 999.0
-                )
+
+                def _since(key: str) -> float:
+                    value = progress_state.get(key)
+                    return (now - value).total_seconds() if isinstance(value, datetime) else 999.0
+
+                seconds_since_last = _since("last_at")
                 stage_changed = stage_key != str(progress_state.get("last_sub_stage") or "")
-                progress_moved = progress_value >= float(progress_state.get("last_progress") or 0.0) + 0.015
+                progress_moved = progress_value >= float(progress_state.get("last_logged_progress") or 0.0) + 0.015
                 message_changed = message_text != str(progress_state.get("last_message") or "")
-                important = stage_changed or progress_moved or progress_value >= 0.98 or message_changed
+                reached_final = progress_value >= 0.98 and not progress_state.get("final_logged")
+                important = stage_changed or progress_moved or reached_final or message_changed
                 if not important and seconds_since_last < 2.0:
                     return
+                # Unchanged heartbeats refresh job.progress but only leave a
+                # log row every HEARTBEAT_LOG_INTERVAL_S.
+                persist_log = important or _since("last_log_at") >= HEARTBEAT_LOG_INTERVAL_S
 
                 with session_scope() as progress_session:
                     progress_job = progress_session.get(ProcessingJob, job_id)
@@ -640,83 +963,116 @@ class JobRunner:
                         return
                     if str(progress_job.status or "").lower() not in {"claimed", "running", "cancel_requested"}:
                         return
-                    progress_config = progress_job.config_json or {}
                     current_progress = float(progress_job.progress or 0.0)
                     progress_job.progress = max(current_progress, progress_value)
                     progress_job.stage = "processing_video"
                     progress_job.updated_at = now
                     progress_session.add(progress_job)
-                    append_job_log(
-                        session=progress_session,
-                        job_id=progress_job.id,
-                        tenant_id=progress_job.tenant_id,
-                        level="info",
-                        stage="processing_video",
-                        message=message_text,
-                        detail_level="detailed",
-                        data={
-                            "sub_stage": stage_key,
-                            "progress": round(progress_job.progress, 4),
-                            **dict(data or {}),
-                        },
-                        # Engine progress IS the workflow view: always
-                        # persist it (the emitter above already rate-limits
-                        # to stage changes / +1.5% progress / new messages).
-                        force_persist=True,
+                    if persist_log:
+                        append_job_log(
+                            session=progress_session,
+                            job_id=progress_job.id,
+                            tenant_id=progress_job.tenant_id,
+                            level="error" if stage_key == "failed" else "info",
+                            stage="processing_video",
+                            message=message_text,
+                            detail_level="detailed",
+                            data={
+                                "sub_stage": stage_key,
+                                "progress": round(progress_job.progress, 4),
+                                **dict(data or {}),
+                            },
+                            # Engine progress IS the workflow view: always
+                            # persist it (rate-limited above to stage changes,
+                            # +1.5% progress, new messages and a 30 s heartbeat).
+                            force_persist=True,
+                        )
+                progress_state.update({"last_at": now, "last_progress": progress_value})
+                if persist_log:
+                    progress_state.update(
+                        {
+                            "last_log_at": now,
+                            "last_logged_progress": progress_value,
+                            "last_sub_stage": stage_key,
+                            "last_message": message_text,
+                        }
                     )
-                progress_state.update(
-                    {
-                        "last_at": now,
-                        "last_progress": progress_value,
-                        "last_sub_stage": stage_key,
-                        "last_message": message_text,
-                    }
-                )
+                    if progress_value >= 0.98:
+                        progress_state["final_logged"] = True
 
-            success = process_video_highlights(
-                video_path=video_path,
-                output_dir=output_dir,
-                select_player=bool(config.get("select_player", False)),
-                pre_seconds=float(config.get("pre_seconds", 2.0)),
-                post_seconds=float(config.get("post_seconds", 6.0)),
-                min_clip_duration=float(config.get("min_clip_duration", config.get("min_clip", 4.0))),
-                no_audio=bool(config.get("no_audio", False)),
-                overlay=bool(config.get("overlay", False)),
-                trim_start=_parse_trim(config.get("trim_start")),
-                trim_end=_parse_trim(config.get("trim_end")),
-                threads=int(config["threads"]) if config.get("threads") is not None else None,
-                require_gpu=bool(config.get("require_gpu", False)),
-                speed_sensitivity=float(config.get("speed_sensitivity", 2.0)),
-                audio_sensitivity=float(config.get("audio_sensitivity", 2.0)),
-                focus_event_types=list(config.get("focus_event_types", []) or []),
-                model_version=str(config.get("model_version")) if config.get("model_version") else None,
-                analysis_only=bool(config.get("analysis_only", False)),
-                camera_mode=str(config.get("camera_mode") or "wide"),
-                zoom_factor=float(config.get("zoom_factor", 1.6)),
-                render_full_follow_cam=bool(config.get("render_full_follow_cam", False)),
-                player_roi=dict(config.get("player_roi") or {}) if isinstance(config.get("player_roi"), dict) else None,
-                yolo_model=str(config.get("yolo_model") or "yolo26s.pt"),
-                tracker_config=str(config.get("tracker_config") or "botsort.yaml"),
-                inference_imgsz=int(config.get("inference_imgsz", 960) or 960),
-                detection_conf=float(config.get("detection_conf", 0.18) or 0.18),
-                vid_stride=int(config.get("vid_stride", 1) or 1),
-                progress_callback=_record_engine_progress,
-                debug=bool(config.get("debug", False)),
-                log_file=str(Path(output_dir) / "pipeline_debug.log") if config.get("debug") else None,
-                debug_video=bool(config.get("debug_video", False)),
-                dump_training_data=bool(config.get("dump_training_data", False)),
-                goal_box_left=dict(config.get("goal_box_left") or {}) if isinstance(config.get("goal_box_left"), dict) else None,
-                goal_box_right=dict(config.get("goal_box_right") or {}) if isinstance(config.get("goal_box_right"), dict) else None,
-                detect_cards=bool(config.get("detect_cards", True)),
-                broadcast_reel=bool(config.get("broadcast_reel", True)),
-                scorebug=bool(config.get("scorebug", True)),
-                team_left=str(config.get("team_left") or "HOME"),
-                team_right=str(config.get("team_right") or "AWAY"),
-                team_left_color=str(config.get("team_left_color")) if config.get("team_left_color") else None,
-                team_right_color=str(config.get("team_right_color")) if config.get("team_right_color") else None,
-                auto_detect_team_colors=bool(config.get("auto_detect_team_colors", False)),
-                llm_report=bool(config.get("llm_report", True)),
-            )
+            def _cfg_int(key: str) -> Optional[int]:
+                value = config.get(key)
+                return int(value) if value not in (None, "") else None
+
+            watcher = threading.Thread(target=_cancel_watcher, name=f"vh-cancel-{job_id}", daemon=True)
+            watcher.start()
+            pipeline_started = time.monotonic()
+            try:
+                success = process_video_highlights(
+                    video_path=video_path,
+                    output_dir=output_dir,
+                    select_player=False,  # interactive selection is impossible on a worker
+                    pre_seconds=float(config.get("pre_seconds", 2.0)),
+                    post_seconds=float(config.get("post_seconds", 6.0)),
+                    min_clip_duration=float(config.get("min_clip_duration", config.get("min_clip", 4.0))),
+                    no_audio=bool(config.get("no_audio", False)),
+                    overlay=bool(config.get("overlay", False)),
+                    trim_start=_parse_trim(config.get("trim_start")),
+                    trim_end=_parse_trim(config.get("trim_end")),
+                    threads=int(config["threads"]) if config.get("threads") is not None else None,
+                    require_gpu=bool(config.get("require_gpu", False)),
+                    speed_sensitivity=float(config.get("speed_sensitivity", 2.0)),
+                    audio_sensitivity=float(config.get("audio_sensitivity", 2.0)),
+                    focus_event_types=list(config.get("focus_event_types", []) or []),
+                    model_version=str(config.get("model_version")) if config.get("model_version") else None,
+                    analysis_only=bool(config.get("analysis_only", False)),
+                    camera_mode=str(config.get("camera_mode") or "wide"),
+                    zoom_factor=float(config.get("zoom_factor", 1.6) or 1.6),
+                    render_full_follow_cam=bool(config.get("render_full_follow_cam", False)),
+                    player_roi=dict(config.get("player_roi") or {}) if isinstance(config.get("player_roi"), dict) else None,
+                    yolo_model=str(config["yolo_model"]) if config.get("yolo_model") else None,
+                    tracker_config=str(config["tracker_config"]) if config.get("tracker_config") else None,
+                    inference_imgsz=_cfg_int("inference_imgsz"),
+                    detection_conf=float(config.get("detection_conf", 0.18) or 0.18),
+                    vid_stride=_cfg_int("vid_stride"),
+                    progress_callback=_record_engine_progress,
+                    debug=bool(config.get("debug", False)),
+                    log_file=str(Path(output_dir) / "pipeline_debug.log") if config.get("debug") else None,
+                    debug_video=bool(config["debug_video"]) if config.get("debug_video") is not None else None,
+                    dump_training_data=bool(config.get("dump_training_data", False)),
+                    goal_box_left=dict(config.get("goal_box_left") or {}) if isinstance(config.get("goal_box_left"), dict) else None,
+                    goal_box_right=dict(config.get("goal_box_right") or {}) if isinstance(config.get("goal_box_right"), dict) else None,
+                    detect_cards=bool(config.get("detect_cards", True)),
+                    broadcast_reel=bool(config.get("broadcast_reel", True)),
+                    scorebug=bool(config.get("scorebug", True)),
+                    team_left=str(config.get("team_left") or "HOME"),
+                    team_right=str(config.get("team_right") or "AWAY"),
+                    team_left_color=str(config.get("team_left_color")) if config.get("team_left_color") else None,
+                    team_right_color=str(config.get("team_right_color")) if config.get("team_right_color") else None,
+                    auto_detect_team_colors=bool(config.get("auto_detect_team_colors", False)),
+                    llm_report=bool(config.get("llm_report", True)),
+                    profile=str(config["profile"]) if config.get("profile") else None,
+                    proxy_height=_cfg_int("proxy_height"),
+                    output_height=_cfg_int("output_height"),
+                    batch_size=config.get("batch_size"),
+                    ball_tiles=bool(config["ball_tiles"]) if config.get("ball_tiles") is not None else None,
+                    use_tensorrt=bool(config["use_tensorrt"]) if config.get("use_tensorrt") is not None else None,
+                    device=str(config["device"]) if config.get("device") else None,
+                    camera_style=str(config["camera_style"]) if config.get("camera_style") else None,
+                    focus_track_id=_cfg_int("focus_track_id"),
+                    reuse_tracking_from=reuse_dir,
+                    pitch_corners=config.get("pitch_corners") if isinstance(config.get("pitch_corners"), list) else None,
+                    reel_minutes=float(config["reel_minutes"]) if config.get("reel_minutes") else None,
+                    reel_preset=str(config["reel_preset"]) if config.get("reel_preset") else None,
+                    player_spotlight_reel=bool(config.get("player_spotlight_reel", False)),
+                    cancel_event=cancel_event,
+                    detector_factory=DETECTOR_FACTORY_OVERRIDE,
+                )
+            finally:
+                watcher_stop.set()
+            pipeline_s = round(time.monotonic() - pipeline_started, 3)
+            _poll_cancel(force=True)
+            was_canceled = cancel_event.is_set()
 
             artifacts = sorted(str(path.resolve()) for path in Path(output_dir).glob("*.mp4"))
             analysis_manifest = _read_analysis_manifest(output_dir)
@@ -736,6 +1092,35 @@ class JobRunner:
                 "tracking_manifest_path": str((Path(output_dir) / "analysis_tracking.json").resolve()),
                 "analysis_table_csv_path": str((Path(output_dir) / "analysis_bookmarks.csv").resolve()),
             }
+            run_dir = Path(output_dir).resolve()
+            run_summary = _read_json_file(run_dir / "run_summary.json")
+            for key, filename in (
+                ("events_path", "analysis_events.json"),
+                ("player_stats_path", "analysis_player_stats.json"),
+                ("team_stats_path", "analysis_team_stats.json"),
+                ("game_states_path", "analysis_game_states.json"),
+                ("tracks_path", "tracks.npz"),
+                ("progress_path", "progress.json"),
+            ):
+                if (run_dir / filename).exists():
+                    result_payload[key] = str(run_dir / filename)
+            proxy_info = dict(run_summary.get("proxy") or {})
+            if proxy_info.get("path"):
+                result_payload["proxy_path"] = proxy_info.get("path")
+                result_payload["proxy"] = proxy_info
+            camera_quality = run_summary.get("camera_quality") or _read_json_file(run_dir / "camera_quality.json")
+            if camera_quality:
+                result_payload["camera_quality"] = camera_quality
+            full_movie = run_dir / "full_follow_ball_zoom.mp4"
+            if full_movie.exists():
+                result_payload["full_follow_cam_path"] = str(full_movie)
+            reel = run_dir / "highlights_reel.mp4"
+            if reel.exists():
+                result_payload["reel_path"] = str(reel)
+            result_payload["timings"] = {**dict(run_summary.get("timings") or {}), "pipeline_s": pipeline_s}
+            result_payload["profile"] = config.get("profile")
+            if reuse_dir:
+                result_payload["reused_tracking_from"] = reuse_dir
 
             with session_scope() as session:
                 job = session.get(ProcessingJob, job_id)
@@ -768,13 +1153,30 @@ class JobRunner:
                     },
                 )
 
-                if success:
+                if was_canceled or job.cancel_requested or str(job.status or "").lower() == "cancel_requested":
+                    job.status = "canceled"
+                    job.stage = "canceled"
+                    job.progress = 1.0
+                    job.result_json = {**result_payload, "canceled": True}
+                    job.error_message = "Job canceled by request"
+                    append_job_log(
+                        session=session,
+                        job_id=job.id,
+                        tenant_id=job.tenant_id,
+                        level="warning",
+                        stage="canceled",
+                        message="Job canceled while processing",
+                        detail_level="basic",
+                        data={"pipeline_returned": bool(success)},
+                    )
+                elif success:
                     created_events = _sync_job_events_from_manifest(
                         session=session,
                         job=job,
                         match=match,
                         config=config,
                         manifest=analysis_manifest,
+                        output_dir=output_dir,
                     )
                     # Attach any highlight carrying a recognized jersey number
                     # to its roster entry. No-op until the CV layer populates
@@ -874,7 +1276,11 @@ class JobRunner:
                     job.stage = "failed"
                     job.progress = 1.0
                     job.result_json = result_payload
-                    job.error_message = "Processing pipeline reported failure"
+                    reason = progress_state.get("failure") or _failure_reason_from_progress(output_dir)
+                    job.error_message = (
+                        f"Processing pipeline reported failure: {reason}" if reason
+                        else "Processing pipeline reported failure"
+                    )
                     append_job_log(
                         session=session,
                         job_id=job.id,
@@ -883,6 +1289,7 @@ class JobRunner:
                         stage="failed",
                         message="Processing pipeline returned failure",
                         detail_level="basic",
+                        data={"reason": reason},
                     )
 
                 job.updated_at = _utcnow()
