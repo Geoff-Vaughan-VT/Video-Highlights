@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class CursorPage(BaseModel):
@@ -21,6 +25,14 @@ EventType = Literal[
     "kickoff",
     "foul",
     "save",
+    "yellow_card",
+    "red_card",
+    # v2 event engine types (analysis_events.json)
+    "chance",
+    "sprint",
+    "dribble",
+    "turnover",
+    "foul_candidate",
 ]
 
 EventStatus = Literal["auto_detected", "confirmed", "corrected", "rejected"]
@@ -82,6 +94,249 @@ class MatchRead(BaseModel):
     updated_at: datetime
 
 
+CameraMode = Literal["wide", "follow_ball", "follow_player", "follow_action"]
+CameraStyle = Literal["broadcast", "tight", "wide"]
+ReelPreset = Literal["1min", "3min", "5min", "10min"]
+
+_JOB_LOGGER = logging.getLogger("videohighlights.job_config")
+_HEX_COLOR = re.compile(r"^#?[0-9a-fA-F]{6}$")
+_DEVICE = re.compile(r"^(auto|cpu|mps|cuda(:\d+)?)$")
+
+
+def media_roots() -> List[Path]:
+    """Allowed media roots from ``VH_MEDIA_ROOTS`` (comma/os.pathsep separated)."""
+    raw = os.getenv("VH_MEDIA_ROOTS", "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for chunk in raw.split(",") for p in chunk.split(os.pathsep) if p.strip()]
+    return [Path(p).expanduser().resolve() for p in parts]
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_seconds(value: Union[float, int, str, None]) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    parts = text.split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError(f"invalid time {value!r}; use seconds, MM:SS or HH:MM:SS")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(f"invalid time {value!r}; use seconds, MM:SS or HH:MM:SS") from exc
+    total = 0.0
+    for n in nums:
+        total = total * 60.0 + n
+    return total
+
+
+class JobConfig(BaseModel):
+    """Typed processing-job configuration (unknown legacy keys are kept).
+
+    Profile keys (``proxy_height``, ``inference_imgsz``, ``vid_stride``,
+    ``yolo_model``, ``batch_size``, ``output_height``, ``debug_video``,
+    ``ball_tiles``, ``tracker_config``) left unset come from ``profile`` via
+    :func:`resolve_job_config`.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    profile: Optional[str] = None
+    camera_mode: Optional[CameraMode] = None
+    camera_style: Optional[CameraStyle] = None
+    zoom_factor: Optional[float] = Field(default=None, ge=1.0, le=4.0)
+    render_full_follow_cam: Optional[bool] = None
+    output_height: Optional[int] = Field(default=None, ge=240, le=2160)
+    proxy_height: Optional[int] = Field(default=None, ge=240, le=2160)
+    inference_imgsz: Optional[int] = Field(default=None, ge=160, le=4096)
+    vid_stride: Optional[int] = Field(default=None, ge=1, le=30)
+    yolo_model: Optional[str] = None
+    tracker_config: Optional[str] = None
+    detection_conf: Optional[float] = Field(default=None, gt=0.0, lt=1.0)
+    batch_size: Optional[Union[int, str]] = None
+    use_tensorrt: Optional[bool] = None
+    ball_tiles: Optional[bool] = None
+    device: Optional[str] = None
+    focus_track_id: Optional[int] = Field(default=None, ge=0)
+    player_roi: Optional[Dict[str, Any]] = None
+    reuse_tracking_from_job: Optional[str] = None
+    pitch_corners: Optional[List[List[float]]] = None
+    reel_minutes: Optional[float] = Field(default=None, gt=0.0, le=120.0)
+    reel_preset: Optional[ReelPreset] = None
+    player_spotlight_reel: Optional[bool] = None
+    team_left: Optional[str] = Field(default=None, max_length=80)
+    team_right: Optional[str] = Field(default=None, max_length=80)
+    team_left_color: Optional[str] = None
+    team_right_color: Optional[str] = None
+    auto_detect_team_colors: Optional[bool] = None
+    detect_cards: Optional[bool] = None
+    broadcast_reel: Optional[bool] = None
+    scorebug: Optional[bool] = None
+    debug_video: Optional[bool] = None
+    dump_training_data: Optional[bool] = None
+    llm_report: Optional[bool] = None
+    trim_start: Optional[Union[float, str]] = None
+    trim_end: Optional[Union[float, str]] = None
+    analysis_only: Optional[bool] = None
+    pre_seconds: Optional[float] = Field(default=None, ge=0.0, le=120.0)
+    post_seconds: Optional[float] = Field(default=None, ge=0.0, le=120.0)
+    min_clip_duration: Optional[float] = Field(default=None, ge=0.0, le=600.0)
+    no_audio: Optional[bool] = None
+    overlay: Optional[bool] = None
+    threads: Optional[int] = Field(default=None, ge=1, le=64)
+    require_gpu: Optional[bool] = None
+    select_player: Optional[bool] = None
+    video_path: Optional[str] = None
+    output_dir: Optional[str] = None
+
+    @field_validator("profile")
+    @classmethod
+    def _check_profile(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        from .services.perf_profiles import PROFILES
+
+        key = str(value).strip().lower()
+        if key not in PROFILES:
+            raise ValueError(f"unknown profile {value!r}; expected one of {', '.join(PROFILES)}")
+        return key
+
+    @field_validator("batch_size")
+    @classmethod
+    def _check_batch(cls, value: Optional[Union[int, str]]) -> Optional[Union[int, str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if value.strip().lower() == "auto":
+                return "auto"
+            if not value.strip().isdigit():
+                raise ValueError("batch_size must be 'auto' or a positive integer")
+            value = int(value.strip())
+        if int(value) < 1 or int(value) > 256:
+            raise ValueError("batch_size must be between 1 and 256")
+        return int(value)
+
+    @field_validator("device")
+    @classmethod
+    def _check_device(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        if not _DEVICE.match(str(value).strip().lower()):
+            raise ValueError("device must be auto, cpu, mps, cuda or cuda:N")
+        return str(value).strip().lower()
+
+    @field_validator("team_left_color", "team_right_color")
+    @classmethod
+    def _check_color(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if not _HEX_COLOR.match(text):
+            raise ValueError("colors must be hex like #d32f2f")
+        return text if text.startswith("#") else f"#{text}"
+
+    @field_validator("pitch_corners")
+    @classmethod
+    def _check_corners(cls, value: Optional[List[List[float]]]) -> Optional[List[List[float]]]:
+        if value is None:
+            return None
+        if len(value) != 4 or any(len(p) != 2 for p in value):
+            raise ValueError("pitch_corners must be 4 [x, y] points (TL, TR, BR, BL)")
+        return [[float(p[0]), float(p[1])] for p in value]
+
+    @field_validator("yolo_model", "tracker_config")
+    @classmethod
+    def _check_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if "\x00" in text or ".." in Path(text).parts:
+            raise ValueError("invalid model/tracker name")
+        return text
+
+    @field_validator("select_player")
+    @classmethod
+    def _check_select(cls, value: Optional[bool]) -> Optional[bool]:
+        if value:
+            raise ValueError(
+                "select_player opens an interactive window and cannot run on the API worker; "
+                "use player_roi or focus_track_id instead"
+            )
+        return value
+
+    @field_validator("video_path", "output_dir")
+    @classmethod
+    def _check_paths(cls, value: Optional[str], info) -> Optional[str]:  # noqa: ANN001
+        if value is None or not str(value).strip():
+            return None
+        from .config import settings
+
+        path = Path(str(value)).expanduser()
+        if "\x00" in str(value):
+            raise ValueError("invalid path")
+        resolved = path.resolve()
+        defaults = [Path(settings.output_root).expanduser().resolve(),
+                    Path(settings.local_storage_root).expanduser().resolve()]
+        roots = media_roots()
+        if roots:
+            if not any(_is_within(resolved, root) for root in roots + defaults):
+                raise ValueError(
+                    f"{info.field_name} must be under the output root or a VH_MEDIA_ROOTS directory"
+                )
+        elif not any(_is_within(resolved, root) for root in defaults):
+            _JOB_LOGGER.warning(
+                "%s %s is outside the output/storage roots; set VH_MEDIA_ROOTS to restrict job paths",
+                info.field_name, resolved,
+            )
+        if info.field_name == "video_path" and roots and not resolved.is_file():
+            raise ValueError(f"video_path does not exist: {resolved}")
+        return str(resolved)
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "JobConfig":
+        start = _parse_seconds(self.trim_start)
+        end = _parse_seconds(self.trim_end)
+        if start is not None and start < 0:
+            raise ValueError("trim_start must be >= 0")
+        if end is not None and end <= 0:
+            raise ValueError("trim_end must be > 0")
+        if start is not None and end is not None and end <= start:
+            raise ValueError("trim_end must be greater than trim_start")
+        return self
+
+
+def validate_job_config(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Validate ``raw`` as :class:`JobConfig` and lay the profile defaults under it.
+
+    Returns the stored config: explicit keys (including unknown legacy keys)
+    plus the resolved profile keys, ``profile`` and ``profile_overrides``.
+    Raises ``ValueError`` / ``pydantic.ValidationError`` on invalid input.
+    """
+    from .services.perf_profiles import resolve_job_config
+
+    model = JobConfig.model_validate(dict(raw or {}))
+    explicit = {k: v for k, v in model.model_dump().items() if v is not None}
+    for key in ("output_dir", "video_path"):
+        if key in (raw or {}) and (raw or {}).get(key) is None:
+            explicit.pop(key, None)
+    return resolve_job_config(explicit, strict=True)
+
+
 class JobCreate(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
@@ -129,7 +384,7 @@ class Participant(BaseModel):
 
 class SignalExplanation(BaseModel):
     signal: str
-    value: float
+    value: Union[float, str, bool, None] = None
 
 
 class EventSource(BaseModel):

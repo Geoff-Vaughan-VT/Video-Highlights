@@ -14,8 +14,9 @@ rest still runs):
              an equivalent single ffmpeg pass (scale + encode + 16 kHz WAV).
 3. detect    detectors.build_detector (or raw ultralytics) on N proxy frames
              at the profile imgsz/batch on the selected device.
-4. render    ffmpeg crop+scale+encode of the source to output_height with a
-             sendcmd-driven pan (the camera_crops.txt mechanism).
+4. render    the production renderer (camera_render.render_camera_plan_video):
+             ffmpeg sendcmd crop + scale + encode of the source to output_height
+             with a per-frame pan/zoom plan.
 5. project   perf_profiles.estimate_runtime for a 90-minute match at the
              source resolution, using the measured fps for proxy/detect/
              render, next to the class reference model.
@@ -281,62 +282,51 @@ def _sync(device_kind: str) -> None:
         pass
 
 
-def stage_render(source: Path, src: Dict[str, Any], output_height: int, work: Path, gpu: Dict[str, Any]) -> Dict[str, Any]:
-    """ffmpeg-native follow-cam render stand-in: fixed 1.8x crop panned by sendcmd, scaled to output_height."""
-    width, height = int(src["width"]), int(src["height"])
-    duration = float(src["duration_s"])
-    zoom = 1.8
-    crop_w = int(width / zoom) // 2 * 2
-    crop_h = int(height / zoom) // 2 * 2
-    out_h = min(int(output_height), height) // 2 * 2
-    out_w = int(round(out_h * crop_w / crop_h)) // 2 * 2
-    # One pan command every 0.2 s (the real renderer writes one per frame).
-    lines = []
-    steps = max(1, int(duration / 0.2))
+def _bench_plan(width: int, height: int, fps: float, frames: int, zoom: float, output_size):
+    """Hand-built CameraPlan: a slow sinusoidal pan + gentle zoom breathing (the
+    crop changes every frame, the worst case for the sendcmd renderer)."""
     import math
 
-    for i in range(steps + 1):
-        t = i * 0.2
-        x = int((width - crop_w) / 2 * (1 + math.sin(t / 3.0))) // 2 * 2
-        y = int((height - crop_h) / 2 * (1 + 0.3 * math.sin(t / 5.0))) // 2 * 2
-        lines.append(f"{t:.3f} crop x {x}, crop y {y};")
-    crops = work / "camera_crops_bench.txt"
-    crops.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    from backend.services.camera_planner import CameraDecision, CameraPlan
 
-    encoder = _pick_encoder(gpu)
-    hwaccel = gpu.get("recommended_hwaccel")
+    decisions = []
+    for i in range(frames):
+        t = i / fps
+        z = max(1.0, zoom * (1.0 + 0.05 * math.sin(t / 7.0)))
+        crop_w, crop_h = width / z, height / z
+        cx = crop_w / 2 + (width - crop_w) / 2 * (1 + math.sin(t / 3.0))
+        cy = crop_h / 2 + (height - crop_h) / 2 * (1 + 0.3 * math.sin(t / 5.0))
+        decisions.append(CameraDecision(index=i, t=t, center_x=cx, center_y=cy, zoom=z, state="in_play",
+                                        focus="ball", reason="bench pan", confidence=1.0))
+    return CameraPlan(start_seconds=0.0, fps=fps, frame_size=(width, height), base_zoom=zoom,
+                      decisions=decisions, output_size=output_size)
+
+
+def stage_render(source: Path, src: Dict[str, Any], output_height: int, work: Path, gpu: Dict[str, Any]) -> Dict[str, Any]:
+    """Final render with the production renderer (camera_render.render_camera_plan_video:
+    ffmpeg crop driven by sendcmd + scale + NVENC/VideoToolbox/x264, audio muxed)."""
+    width, height = int(src["width"]), int(src["height"])
+    fps = float(src.get("video_fps") or 30.0)
+    frames = int(src["frames"]) or int(float(src["duration_s"]) * fps)
+    out_h = min(int(output_height), height) // 2 * 2
+    out_w = int(round(out_h * 16 / 9)) // 2 * 2
+    zoom = max(1.0, min(1.8, height / float(out_h)))
+    from backend.services import camera_render
+
+    plan = _bench_plan(width, height, fps, frames, zoom, (out_w, out_h))
     out = work / "render_bench.mp4"
-    vf = f"sendcmd=f={crops.name},crop={crop_w}:{crop_h}:0:0,scale={out_w}:{out_h}:flags=bicubic,setsar=1"
-
-    def make_cmd(enc: str, accel: Optional[str]) -> List[str]:
-        cmd = [_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y"]
-        if accel:
-            cmd += ["-hwaccel", str(accel)]
-        return cmd + ["-i", str(source), "-vf", vf, *_encoder_args(enc), "-pix_fmt", "yuv420p",
-                      "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)]
-
-    impl = "ffmpeg crop(sendcmd)+scale+encode stand-in"
-    try:
-        from backend.services import camera_render  # workstream B
-
-        names = [n for n in dir(camera_render) if "ffmpeg" in n.lower() or "sendcmd" in n.lower() or "crops" in n.lower()]
-        if names:
-            impl += f" (camera_render exposes {', '.join(names)}; wire it in once its signature is final)"
-    except Exception:
-        pass
+    info: Dict[str, Any] = {}
     started = time.perf_counter()
-    proc = subprocess.run(make_cmd(encoder, hwaccel), cwd=str(work), stdin=subprocess.DEVNULL, capture_output=True, text=True)
-    if proc.returncode != 0 and (encoder != "libx264" or hwaccel):
-        impl += f"; {encoder}/{hwaccel} failed, retried libx264 software"
-        encoder, hwaccel = "libx264", None
-        started = time.perf_counter()
-        proc = subprocess.run(make_cmd(encoder, None), cwd=str(work), stdin=subprocess.DEVNULL, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip()[-400:])
+    camera_render.render_camera_plan_video(
+        video_path=str(source), output_path=str(out), plan=plan, include_audio=True,
+        output_size=(out_w, out_h), encoder="auto", hwaccel="auto", engine="ffmpeg",
+        progress_info_callback=lambda data: info.update(data),
+    )
     elapsed = time.perf_counter() - started
-    frames = int(src["frames"])
-    return {"impl": impl, "encoder": encoder, "hwaccel": hwaccel, "output": f"{out_w}x{out_h}",
-            "frames": frames, "seconds": round(elapsed, 3), "fps": frames / max(elapsed, 1e-6)}
+    return {"impl": "camera_render.render_camera_plan_video (ffmpeg sendcmd crop+scale)",
+            "encoder": gpu.get("recommended_encoder"), "hwaccel": gpu.get("recommended_hwaccel"),
+            "output": f"{out_w}x{out_h}", "zoom": round(zoom, 3), "frames": frames,
+            "seconds": round(elapsed, 3), "fps": frames / max(elapsed, 1e-6)}
 
 
 # ---------------------------------------------------------------------------
