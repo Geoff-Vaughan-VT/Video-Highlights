@@ -140,6 +140,32 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _coerce_to_media_root(text: str, roots: List[Path]) -> Optional[Path]:
+    """Best-effort map of a host-style path onto a file under one of ``roots``.
+
+    Windows users naturally paste a host path (``C:\\...\\Media\\clip.mp4``) or
+    a bare filename (``clip.mp4``) instead of the in-container path
+    (``/media/clip.mp4``). Backslashes are not separators on POSIX, so such
+    inputs never resolve under a root. Split the input on both separators and
+    try progressively shorter trailing suffixes against each root, returning
+    the first that points at an existing file. The result must exist under a
+    configured root, so the media-root policy is preserved.
+    """
+    raw = text.strip().replace("\\", "/")
+    parts = [p for p in raw.split("/") if p and p not in (".", "..")]
+    if not parts:
+        return None
+    for root in roots:
+        for i in range(len(parts)):
+            candidate = root.joinpath(*parts[i:])
+            try:
+                if candidate.exists():
+                    return candidate.resolve()
+            except OSError:
+                continue
+    return None
+
+
 def check_media_path(value: str, *, field: str = "video_path") -> Path:
     """Resolve a source-video path and enforce the media-root policy.
 
@@ -165,6 +191,16 @@ def check_media_path(value: str, *, field: str = "video_path") -> Path:
         raise ValueError(f"{field} must not point inside the output root ({output_root})")
     roots = media_roots()
     if roots and not any(_is_within(resolved, root) for root in roots):
+        coerced = _coerce_to_media_root(text, roots + [storage_root])
+        if (
+            coerced is not None
+            and not _is_within(coerced, output_root)
+            and (
+                any(_is_within(coerced, root) for root in roots)
+                or _is_within(coerced, storage_root)
+            )
+        ):
+            return coerced
         raise ValueError(f"{field} must be under a VH_MEDIA_ROOTS directory or the upload storage root")
     return resolved
 

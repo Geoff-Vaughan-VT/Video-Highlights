@@ -274,6 +274,51 @@ def test_match_source_paths_follow_media_roots(client: TestClient, tmp_path: Pat
     assert client.get(f"/v1/matches/{match_id}").json()["source_video_path"] == str(inside)
 
 
+def test_check_media_path_coerces_host_style_paths(tmp_path: Path, monkeypatch) -> None:
+    """A Windows host path or a bare filename resolves onto the real file under
+    a media root, so desktop users need not hand-translate to the /media path."""
+    from backend.schemas import check_media_path
+
+    media = tmp_path / "media"
+    media.mkdir()
+    inside = _source(media, "game.mp4")
+    monkeypatch.setenv("VH_MEDIA_ROOTS", str(media))
+
+    expected = inside.resolve()
+    # Already-correct absolute path still works (direct match, pre-fallback).
+    assert check_media_path(str(inside)) == expected
+    # Bare filename.
+    assert check_media_path("game.mp4") == expected
+    # Relative "media/<name>" (the root's own folder name repeated).
+    assert check_media_path("media/game.mp4") == expected
+    # Windows-style host path with backslashes and a drive letter.
+    assert check_media_path(r"C:\Users\someone\media\game.mp4") == expected
+
+
+def test_check_media_path_coercion_preserves_the_security_boundary(tmp_path: Path, monkeypatch) -> None:
+    """Coercion only accepts files that actually exist under a media/storage
+    root; it never maps a path onto the output root or a nonexistent file."""
+    from backend.schemas import check_media_path
+
+    media = tmp_path / "media"
+    media.mkdir()
+    monkeypatch.setenv("VH_MEDIA_ROOTS", str(media))
+
+    # A real file that lives outside any root is not reachable by coercion.
+    outside = _source(tmp_path, "secret.mp4")
+    with pytest.raises(ValueError, match="VH_MEDIA_ROOTS"):
+        check_media_path(str(outside))
+    # A bare name with no matching file under the roots is rejected.
+    with pytest.raises(ValueError, match="VH_MEDIA_ROOTS"):
+        check_media_path("does_not_exist.mp4")
+    # A file that exists only under the output root is never coerced in.
+    output_root = Path(settings.output_root).resolve()
+    (output_root / "job_x").mkdir(parents=True)
+    (output_root / "job_x" / "movie.mp4").write_bytes(b"movie")
+    with pytest.raises(ValueError):
+        check_media_path("movie.mp4")
+
+
 # ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------
